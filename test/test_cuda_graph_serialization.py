@@ -351,5 +351,107 @@ class TestCUDAGraphSave(TestCase):
             self.assertIn("no cubins were captured", out)
 
 
+@skipIfRocm
+@requires_cuda
+@requires_cuda_python_bindings
+@unittest.skipIf(
+    not _kernel_capture_available(), "requires cupti-python and a usable CUPTI"
+)
+class TestCUDAGraphLoad(TestCase):
+    """A saved graph replays in a process that never captured it.
+
+    Both halves run in subprocesses: saving needs capture armed before any CUDA
+    work, and loading must happen before anything else allocates, since the whole
+    point is to reclaim the addresses the graph was captured against.
+    """
+
+    _SAVE = """
+import torch
+from torch.cuda import _graph_kernel_capture as cap
+assert cap.start()
+torch.manual_seed(0)
+a = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+out = torch.empty(512, 512, device="cuda", dtype=torch.bfloat16)
+
+def work():
+    torch.mm(a, a, out=out)
+
+stream = torch.cuda.Stream()
+stream.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(stream):
+    for _ in range(3):
+        work()
+torch.cuda.current_stream().wait_stream(stream)
+graph = torch.cuda.CUDAGraph(keep_graph=True)
+with torch.cuda.graph(graph):
+    work()
+graph.replay()
+torch.cuda.synchronize()
+cap.stop()
+graph.save({archive!r}, tensors={{"a": a, "out": out}})
+torch.save({{"a": a.cpu(), "out": out.cpu()}}, {state!r})
+"""
+
+    _LOAD = """
+import json
+import torch
+from torch.cuda._graph_serialization import load
+
+held = {{}}
+
+def load_fn():
+    # contents must be materialised on the host: allocating on the device here
+    # would take the addresses being reclaimed
+    held["state"] = torch.load({state!r}, map_location="cpu")
+    assert all(not v.is_cuda for v in held["state"].values())
+    return {{"a": held["state"]["a"]}}
+
+graph, tensors = load({archive!r}, load_fn=load_fn)
+addresses = {{k: v.data_ptr() for k, v in tensors.items()}}
+tensors["out"].zero_()
+graph.replay()
+torch.cuda.synchronize()
+print(json.dumps({{
+    "addresses": addresses,
+    "matches": torch.equal(tensors["out"].cpu(), held["state"]["out"]),
+    "names": sorted(tensors),
+}}))
+"""
+
+    def _run(self, script):
+        env = os.environ.copy()
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        proc = subprocess.run(
+            [sys.executable, "-c", script], env=env, capture_output=True
+        )
+        output = proc.stdout.decode() + proc.stderr.decode()
+        if proc.returncode != 0:
+            self.fail(f"subprocess failed:\n{output}")
+        return output
+
+    def test_replays_in_a_process_that_never_captured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "graph.ptcg")
+            state = os.path.join(tmp, "state.pt")
+            self._run(self._SAVE.format(archive=archive, state=state))
+            manifest, _records = self._manifest(archive)
+            saved = {t["name"]: t["address"] for t in manifest["tensors"]}
+
+            out = self._run(self._LOAD.format(archive=archive, state=state))
+            result = json.loads(out.strip().splitlines()[-1])
+
+            self.assertEqual(result["names"], ["a", "out"])
+            # the addresses are reclaimed, not merely allocated somewhere
+            self.assertEqual(result["addresses"], saved)
+            # and replaying reproduces the output bit for bit, from contents that
+            # arrived on the host rather than in the archive
+            self.assertTrue(result["matches"])
+
+    def _manifest(self, path):
+        with zipfile.ZipFile(path) as archive:
+            name = next(n for n in archive.namelist() if n.endswith("manifest.json"))
+            return json.loads(archive.read(name)), archive.namelist()
+
+
 if __name__ == "__main__":
     run_tests()
