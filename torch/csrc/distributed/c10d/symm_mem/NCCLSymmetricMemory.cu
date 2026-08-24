@@ -185,13 +185,13 @@ void release_nccl_devcomms_for_group(
 #ifdef USE_ROCM
 namespace {
 // Snapshot of the RCCL window preconditions (NCCL_CUMEM_ENABLE /
-// NCCL_WIN_ENABLE) as they were when the host comm for a group was created --
-// the moment RCCL actually sampled them in ncclCommInitRank. Keyed by
-// (device index, group name); last write wins (a successor comm under the same
-// name overwrites). Enforced by the rendezvous path so a user who sets the vars
-// after init_process_group cannot pass a stale environment read.
+// NCCL_WIN_ENABLE) as they were when a host comm was created -- the moment RCCL
+// actually sampled them in ncclCommInitRank. Keyed by the host ncclComm_t (not
+// by group name) so rendezvous looks it up by the comm it resolves: a later
+// comm reusing a group name gets its own (or no) entry and never inherits a
+// destroyed comm's value.
 struct RcclSymmPreconditionMap {
-  ska::flat_hash_map<int, ska::flat_hash_map<std::string, bool>> by_device;
+  ska::flat_hash_map<ncclComm_t, bool> by_comm;
   std::mutex mutex;
 };
 
@@ -200,36 +200,31 @@ RcclSymmPreconditionMap& rccl_symm_precondition_map() {
   return m;
 }
 
-std::optional<bool> rccl_symm_precondition_lookup(
-    const c10::Device& device,
-    const std::string& group_name) {
+std::optional<bool> rccl_symm_precondition_lookup(ncclComm_t comm) {
   auto& m = rccl_symm_precondition_map();
   std::lock_guard<std::mutex> lock(m.mutex);
-  auto dev_it = m.by_device.find(device.index());
-  if (dev_it == m.by_device.end()) {
-    return std::nullopt;
-  }
-  auto it = dev_it->second.find(group_name);
-  if (it == dev_it->second.end()) {
+  auto it = m.by_comm.find(comm);
+  if (it == m.by_comm.end()) {
     return std::nullopt;
   }
   return it->second;
 }
 } // namespace
 
-void note_rccl_symm_precondition(
-    const c10::Device& device,
-    const std::string& group_name,
-    bool ok) {
+void note_rccl_symm_precondition(void* comm, bool ok) {
   auto& m = rccl_symm_precondition_map();
   std::lock_guard<std::mutex> lock(m.mutex);
-  m.by_device[device.index()][group_name] = ok;
+  m.by_comm[static_cast<ncclComm_t>(comm)] = ok;
+}
+
+void forget_rccl_symm_precondition(void* comm) {
+  auto& m = rccl_symm_precondition_map();
+  std::lock_guard<std::mutex> lock(m.mutex);
+  m.by_comm.erase(static_cast<ncclComm_t>(comm));
 }
 #else
-void note_rccl_symm_precondition(
-    const c10::Device&,
-    const std::string&,
-    bool) {}
+void note_rccl_symm_precondition(void*, bool) {}
+void forget_rccl_symm_precondition(void*) {}
 #endif // USE_ROCM
 
 /* Start of NCCLAllocation implementation */
@@ -410,11 +405,9 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
     // RCCL samples these inside ncclCommInitRank -- before symm_mem is ever
     // requested -- so enforce the value recorded at comm-init time rather than
     // re-reading the environment now (it may have changed since init). Fall back
-    // to the live environment only when no snapshot was recorded (e.g. a
-    // non-PyTorch producer populated the comm registry).
-    const c10::Device rocm_device(c10::DeviceType::CUDA, device_idx_);
-    const std::optional<bool> precond =
-        rccl_symm_precondition_lookup(rocm_device, group_name_);
+    // to the live environment only when this comm has no snapshot (e.g. a
+    // non-PyTorch producer populated the comm registry without recording one).
+    const std::optional<bool> precond = rccl_symm_precondition_lookup(comm_);
     const bool precond_ok = precond.has_value()
         ? *precond
         : (c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&

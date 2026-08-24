@@ -40,9 +40,17 @@ void release_nccl_devcomms_for_group(
 // the value cannot be re-derived at rendezvous (the environment may have
 // changed). The producing backend calls this right after comm creation; the
 // ROCm rendezvous path enforces the recorded snapshot. No-op off ROCm.
-void note_rccl_symm_precondition(
-    const c10::Device& device,
-    const std::string& group_name,
-    bool ok);
+//
+// Keyed by the host communicator (`comm`, an ncclComm_t passed as void*), not
+// by group name: rendezvous looks the snapshot up by the comm it resolves, so a
+// later comm reusing a group name -- including a producer that never records a
+// snapshot -- misses and falls back to the live environment instead of
+// inheriting a destroyed group's value.
+void note_rccl_symm_precondition(void* comm, bool ok);
+
+// Drop the snapshot recorded for `comm`. The owning backend calls this when the
+// communicator tears down so a reused ncclComm_t pointer cannot inherit a dead
+// comm's value. No-op off ROCm.
+void forget_rccl_symm_precondition(void* comm);
 
 } // namespace c10d::symmetric_memory
