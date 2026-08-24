@@ -189,7 +189,7 @@ class _BatchNorm(_NormBase):
             if self.num_batches_tracked is not None:  # type: ignore[has-type]
                 self.num_batches_tracked.add_(1)  # type: ignore[has-type]
                 if self.momentum is None:  # use cumulative moving average
-                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+                    exponential_average_factor = 1.0 / self.num_batches_tracked
                 else:  # use exponential moving average
                     exponential_average_factor = self.momentum
 
@@ -807,7 +807,7 @@ class SyncBatchNorm(_BatchNorm):
                 raise AssertionError("num_batches_tracked must not be None")
             self.num_batches_tracked.add_(1)
             if self.momentum is None:  # use cumulative moving average
-                exponential_average_factor = 1.0 / self.num_batches_tracked.item()
+                exponential_average_factor = 1.0 / self.num_batches_tracked
             else:  # use exponential moving average
                 exponential_average_factor = self.momentum
 

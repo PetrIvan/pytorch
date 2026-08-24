@@ -2869,7 +2869,7 @@ def batch_norm(
     weight: Tensor | None = None,
     bias: Tensor | None = None,
     training: bool = False,
-    momentum: float = 0.1,
+    momentum: float | Tensor = 0.1,
     eps: float = 1e-5,
 ) -> Tensor:
     r"""Apply Batch Normalization for each channel across a batch of data.
@@ -2900,6 +2900,35 @@ def batch_norm(
         )
     elif eps < 0.0:
         raise ValueError(f"batch_norm eps must be non-negative, but got {eps}")
+
+    if isinstance(momentum, Tensor):
+        if training and (running_mean is not None or running_var is not None):
+            output, save_mean, save_invstd = torch.native_batch_norm(
+                input, weight, bias, None, None, training, 0.0, eps
+            )
+            if running_mean is not None:
+                running_mean.lerp_(save_mean, momentum)
+            if running_var is not None:
+                n = input.numel() / input.shape[1]
+                unbiased_var = (
+                    (save_invstd.reciprocal().square() - eps) * (n / (n - 1))
+                    if n > 1
+                    else save_invstd.reciprocal().square() - eps
+                )
+                running_var.lerp_(unbiased_var, momentum)
+            return output
+        else:
+            return torch.batch_norm(
+                input,
+                weight,
+                bias,
+                running_mean,
+                running_var,
+                training,
+                0.0,
+                eps,
+                torch.backends.cudnn.enabled,
+            )
 
     return torch.batch_norm(
         input,
