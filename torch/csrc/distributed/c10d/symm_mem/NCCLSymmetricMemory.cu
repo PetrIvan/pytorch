@@ -21,6 +21,7 @@
 #include <c10/util/env.h>
 #include <c10/util/error.h>
 #include <mutex>
+#include <optional>
 #include <c10/util/flat_hash_map.h>
 #include <c10/util/hash.h>
 
@@ -180,6 +181,56 @@ void release_nccl_devcomms_for_group(
     void*) {}
 
 #endif // NCCL_HAS_LSA_PEER_PTR
+
+#ifdef USE_ROCM
+namespace {
+// Snapshot of the RCCL window preconditions (NCCL_CUMEM_ENABLE /
+// NCCL_WIN_ENABLE) as they were when the host comm for a group was created --
+// the moment RCCL actually sampled them in ncclCommInitRank. Keyed by
+// (device index, group name); last write wins (a successor comm under the same
+// name overwrites). Enforced by the rendezvous path so a user who sets the vars
+// after init_process_group cannot pass a stale environment read.
+struct RcclSymmPreconditionMap {
+  ska::flat_hash_map<int, ska::flat_hash_map<std::string, bool>> by_device;
+  std::mutex mutex;
+};
+
+RcclSymmPreconditionMap& rccl_symm_precondition_map() {
+  static RcclSymmPreconditionMap m;
+  return m;
+}
+
+std::optional<bool> rccl_symm_precondition_lookup(
+    const c10::Device& device,
+    const std::string& group_name) {
+  auto& m = rccl_symm_precondition_map();
+  std::lock_guard<std::mutex> lock(m.mutex);
+  auto dev_it = m.by_device.find(device.index());
+  if (dev_it == m.by_device.end()) {
+    return std::nullopt;
+  }
+  auto it = dev_it->second.find(group_name);
+  if (it == dev_it->second.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+} // namespace
+
+void note_rccl_symm_precondition(
+    const c10::Device& device,
+    const std::string& group_name,
+    bool ok) {
+  auto& m = rccl_symm_precondition_map();
+  std::lock_guard<std::mutex> lock(m.mutex);
+  m.by_device[device.index()][group_name] = ok;
+}
+#else
+void note_rccl_symm_precondition(
+    const c10::Device&,
+    const std::string&,
+    bool) {}
+#endif // USE_ROCM
 
 /* Start of NCCLAllocation implementation */
 
@@ -354,14 +405,22 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
         "`init_process_group` call.");
 
 #ifdef USE_ROCM
-    // RCCL symmetric-memory windows require VMM (cuMem) and window
-    // registration, both disabled by default in RCCL. RCCL reads these at
-    // ncclCommInitRank -- before symm_mem is ever requested -- so they cannot
-    // be enabled from here; fail with actionable guidance instead of letting
-    // ncclCommWindowRegister fail confusingly deep inside RCCL.
+    // RCCL symmetric-memory windows require VMM (cuMem) and window registration
+    // (NCCL_CUMEM_ENABLE / NCCL_WIN_ENABLE), both disabled by default in RCCL.
+    // RCCL samples these inside ncclCommInitRank -- before symm_mem is ever
+    // requested -- so enforce the value recorded at comm-init time rather than
+    // re-reading the environment now (it may have changed since init). Fall back
+    // to the live environment only when no snapshot was recorded (e.g. a
+    // non-PyTorch producer populated the comm registry).
+    const c10::Device rocm_device(c10::DeviceType::CUDA, device_idx_);
+    const std::optional<bool> precond =
+        rccl_symm_precondition_lookup(rocm_device, group_name_);
+    const bool precond_ok = precond.has_value()
+        ? *precond
+        : (c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&
+           c10::utils::check_env("NCCL_WIN_ENABLE") == true);
     TORCH_CHECK(
-        c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&
-            c10::utils::check_env("NCCL_WIN_ENABLE") == true,
+        precond_ok,
         "RCCL symmetric memory requires NCCL_CUMEM_ENABLE=1 and "
         "NCCL_WIN_ENABLE=1 to be set in the environment before "
         "init_process_group. Set both and re-run.");

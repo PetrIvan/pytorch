@@ -3332,6 +3332,17 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
         options_->group_name.empty() ? "0" : options_->group_name;
     c10d::symmetric_memory::NCCLDevCommManager::get(device).register_comm(
         symmMemGroupName, ncclComm->getNcclComm());
+#ifdef USE_ROCM
+    // RCCL samples NCCL_CUMEM_ENABLE / NCCL_WIN_ENABLE here, inside
+    // ncclCommInitRank. Snapshot them now so the symm-mem rendezvous path can
+    // enforce what RCCL actually saw at comm init, rather than re-reading an
+    // environment that may have changed by the time symm_mem is requested.
+    c10d::symmetric_memory::note_rccl_symm_precondition(
+        device,
+        symmMemGroupName,
+        c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&
+            c10::utils::check_env("NCCL_WIN_ENABLE") == true);
+#endif
 #endif
   }
 

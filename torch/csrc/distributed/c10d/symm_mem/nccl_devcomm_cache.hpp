@@ -34,4 +34,15 @@ void release_nccl_devcomms_for_group(
     const std::string& group_name,
     void* comm);
 
+// Record, at communicator-init time, whether the RCCL symmetric-memory window
+// preconditions (NCCL_CUMEM_ENABLE / NCCL_WIN_ENABLE) were set. RCCL samples
+// these env vars inside ncclCommInitRank, i.e. before symm_mem is requested, so
+// the value cannot be re-derived at rendezvous (the environment may have
+// changed). The producing backend calls this right after comm creation; the
+// ROCm rendezvous path enforces the recorded snapshot. No-op off ROCm.
+void note_rccl_symm_precondition(
+    const c10::Device& device,
+    const std::string& group_name,
+    bool ok);
+
 } // namespace c10d::symmetric_memory

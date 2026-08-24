@@ -710,17 +710,21 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
     )
     @skip_if_lt_x_gpu(2)
     def test_nccl_symmem_devcomm_group_destroy_recreate(self):
-        # reduce_scatter_offset builds a device communicator cached under the
-        # process group's (name, owning host comm). Destroying the group must
-        # release those device communicators through the identity-safe path
-        # (release_nccl_devcomms_for_group, keyed by the owning comm) so a newly
-        # created group builds and uses its own without tripping the stale-owner
-        # TORCH_INTERNAL_ASSERT in get_or_create_nccl_devcomm. On CUDA the
-        # device communicators live in NCCLDevCommManager (this owned cache is
-        # ROCm-only), so this test targets ROCm. This covers the
-        # release + recreate lifetime across create/destroy cycles; it does not
-        # reproduce the same-group-name restart-after-error race (which needs an
-        # aborted comm and a forced identical group name).
+        # Lifetime smoke test for the ROCm owned devcomm cache: repeatedly
+        # create a group, build+use a device communicator via
+        # reduce_scatter_offset, then destroy the group. Exercises the
+        # get_or_create (fresh create) and release(comm) (owner-matched erase)
+        # paths across create/destroy cycles with real communicators. (On CUDA
+        # the device communicators live in NCCLDevCommManager, so this is ROCm
+        # only.)
+        #
+        # It does NOT pin the same-group-name restart path (stale-owner rebuild
+        # in get_or_create when owner != comm, or the leave-successor release):
+        # new_group cannot reuse a group name because _hash_ranks_to_str salts
+        # the name with the monotonic _world.group_count. That branch is a
+        # pointer-identity mirror of the reviewed NCCLDevCommManager
+        # unregister_comm(name, comm) pattern; reproducing it would require
+        # default-group abort/re-init, which is not worth the fragility here.
         symm_mem.set_backend("NCCL")
         torch.cuda.set_device(self.rank)
         c10d.all_reduce(torch.ones(1, device=self.device))
@@ -1433,6 +1437,80 @@ class NCCLSymmetricMemoryNccl2Test(MultiProcContinuousTest):
 
 class NCCLSymmetricMemoryNcclLazyTest(NCCLSymmetricMemoryNccl2Test):
     backend_name = "nccl-lazy"
+
+
+@requires_cuda_p2p_access()
+@skip_but_pass_in_sandcastle_if(
+    TEST_WITH_ROCM and getRocmVersion() == (7, 14),
+    "RCCL CUMEM/P2P communicator init fails on ROCm 7.14 (p2p_tmp.cc:358)",
+)
+class NCCLSymmetricMemoryWinDisabledTest(MultiProcContinuousTest):
+    """RCCL symmetric-memory precondition fail-fast.
+
+    The process group is created with NCCL_WIN_ENABLE=0, so RCCL builds the comm
+    without window support. Rendezvous must fail fast with the documented error,
+    driven by the snapshot recorded at comm init -- not a re-read of the (since
+    restored) environment.
+    """
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda", self.rank)
+
+    @classmethod
+    def _init_pg(cls, rank, world_size, rdvz_file):
+        if rdvz_file is None:
+            raise AssertionError("Expected rdvz_file to not be None")
+        os.environ["LOCAL_RANK"] = str(rank)
+        # Force NCCL_WIN_ENABLE=0 only across this comm's creation -- RCCL samples
+        # it inside init_process_group. Afterwards set it back to "1" so the live
+        # environment is healthy at rendezvous: the fail-fast then can only come
+        # from the init-time snapshot (a regression to reading the current env
+        # would pass). Leaving it "1" also avoids polluting sibling classes.
+        if TEST_WITH_ROCM:
+            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+            os.environ["NCCL_WIN_ENABLE"] = "0"
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        store = c10d.FileStore(rdvz_file, world_size)
+        try:
+            c10d.init_process_group(
+                backend="nccl",
+                world_size=world_size,
+                rank=rank,
+                store=store,
+                timeout=cls.timeout,
+                device_id=device,
+            )
+        finally:
+            if TEST_WITH_ROCM:
+                os.environ["NCCL_WIN_ENABLE"] = "1"
+        cls.pg = c10d.distributed_c10d._get_default_group()
+
+    @skip_but_pass_in_sandcastle_if(
+        not TEST_WITH_ROCM, "ROCm-only: RCCL window precondition"
+    )
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_nccl_symmem_precondition_fail_fast(self):
+        # _init_pg created the comm with NCCL_WIN_ENABLE=0 then set it back to
+        # "1", so the live environment is healthy here. Rendezvous must still
+        # raise from the init-time snapshot -- proving the check reflects what
+        # RCCL saw at comm creation, not the current environment.
+        self.assertEqual(os.environ.get("NCCL_WIN_ENABLE"), "1")
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        tensor = symm_mem.empty(64, dtype=torch.float32, device=self.device)
+        with self.assertRaisesRegex(
+            RuntimeError, r"NCCL_CUMEM_ENABLE=1 and NCCL_WIN_ENABLE=1"
+        ):
+            symm_mem.rendezvous(tensor, group=group_name)
 
 
 instantiate_device_type_tests(TestNCCL, globals(), only_for="cuda")
