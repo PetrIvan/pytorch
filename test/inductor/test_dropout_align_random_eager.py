@@ -172,7 +172,6 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         "https://github.com/pytorch/pytorch/issues/190237"
     )
     def test_linear_block_compile_parity_forward(self, device):
-
         for training in (False, True):
             eager, compiled = build_models(DROPOUT_P)
             eager.to(device)
@@ -203,7 +202,6 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         "https://github.com/pytorch/pytorch/issues/190237"
     )
     def test_linear_block_compile_parity_backward(self, device):
-
         eager, compiled = build_models(DROPOUT_P)
         eager.to(device)
         compiled.to(device)
@@ -267,7 +265,7 @@ class TestDropoutAlignRandomEager(InductorTestCase):
                 1e-4,
                 msg=lambda msg: (
                     f"{msg}\nDropout mask mismatch ratio too high: {mismatch_ratio:.8f}"
-                ),  # noqa: B950
+                ),
             )
             self.assertEqual(seed0_e, BASE_SEED)
             self.assertEqual(seed0_c, BASE_SEED)
@@ -276,7 +274,7 @@ class TestDropoutAlignRandomEager(InductorTestCase):
                 delta_c,
                 msg=lambda msg: (
                     f"{msg}\nRNG offset delta mismatch: eager={delta_e}, compiled={delta_c}"
-                ),  # noqa: B950
+                ),
             )
 
     # ───────────────────────────────────────────────────────────
