@@ -25,8 +25,13 @@ void* get_or_create_nccl_devcomm(
     int lsa_barrier_count,
     bool lsa_multimem);
 
+// Identity-safe teardown: erase only the device communicators owned by `comm`
+// (the host ncclComm_t, passed as void* so this header stays free of NCCL
+// types). A stale producer whose comm was already replaced by a successor
+// under the same group name becomes a no-op, so it cannot wipe the successor.
 void release_nccl_devcomms_for_group(
     const c10::Device& device,
-    const std::string& group_name);
+    const std::string& group_name,
+    void* comm);
 
 } // namespace c10d::symmetric_memory

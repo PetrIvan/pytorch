@@ -5,6 +5,7 @@
 #include <torch/csrc/distributed/c10d/symm_mem/macros.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_cache.hpp>
+#include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_device_shims.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_extension.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/NCCLSymmetricMemory.hpp>
@@ -213,10 +214,12 @@ void nccl_reduce_scatter_offset(
 
   // lsaBarrierCount must cover the maximum number of concurrent CTAs.
   // lsaMultimem is set when the allocation has multicast support.
-  // Device communicators are cached per (group, mode); entries die with the
-  // owning process group, so a recreated group can never reuse a device
-  // communicator created for its predecessor. The mode is part of the key
-  // because lsaMultimem is baked into the created device communicator.
+#ifdef NCCL_HAS_LSA_PEER_PTR
+  // ROCm: the device communicator lives in the symm-mem owned cache (RCCL
+  // cannot name ncclDevComm in host TUs). Entries die with the owning process
+  // group, so a recreated group can never reuse a predecessor's communicator.
+  // The mode is part of the key because lsaMultimem is baked into the created
+  // device communicator.
   static constexpr char const kDevcommKeyMultimem[] =
       "nccl_reduce_scatter_offset_multimem";
   static constexpr char const kDevcommKeyLsa[] =
@@ -225,6 +228,25 @@ void nccl_reduce_scatter_offset(
   ncclDevComm& devcomm = *static_cast<ncclDevComm*>(
       c10d::symmetric_memory::get_or_create_nccl_devcomm(
           device, group_name, devcomm_key, RS_MAX_CTA_COUNT, use_multimem));
+#else
+  // CUDA: NCCLDevCommManager owns the device communicator (its host header can
+  // name ncclDevComm). Cached per (group, key); created on first use.
+  auto& manager = c10d::symmetric_memory::NCCLDevCommManager::get(device);
+  ncclComm_t comm = manager.get_comm(group_name);
+  static constexpr char const kDevcommKey[] = "nccl_reduce_scatter_offset";
+  auto devcomm_opt = manager.get_devcomm(group_name, kDevcommKey);
+  if (!devcomm_opt) {
+    ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    reqs.lsaBarrierCount = RS_MAX_CTA_COUNT;
+    reqs.lsaMultimem = use_multimem;
+    ncclDevComm devcomm;
+    C10D_NCCL_CHECK(
+        ncclDevCommCreate(comm, &reqs, &devcomm),
+        "ncclDevCommCreate failed in nccl_reduce_scatter_offset");
+    devcomm_opt = manager.register_devcomm(group_name, devcomm, kDevcommKey);
+  }
+  ncclDevComm& devcomm = devcomm_opt->get();
+#endif
 
   const int my_rank = devcomm.rank;
   const int group_size = devcomm.nRanks;

@@ -5,6 +5,7 @@
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_cache.hpp>
+#include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_device_shims.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_extension.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/NCCLSymmetricMemory.hpp>
@@ -171,14 +172,33 @@ void nccl_all_to_all_nd(
   auto stream = at::cuda::getCurrentCUDAStream();
   auto device = input.device();
 
-  // Device communicators are cached per group; entries die with the owning
-  // process group, so a recreated group can never reuse a device communicator
-  // created for its predecessor.
+#ifdef NCCL_HAS_LSA_PEER_PTR
+  // ROCm: the device communicator lives in the symm-mem owned cache (RCCL
+  // cannot name ncclDevComm in host TUs). Entries die with the owning process
+  // group, so a recreated group can never reuse a predecessor's communicator.
   static constexpr char const kDevcommKey[] = "nccl_all_to_all_nd";
   ncclDevComm& devcomm = *static_cast<ncclDevComm*>(
       c10d::symmetric_memory::get_or_create_nccl_devcomm(
           device, group_name, kDevcommKey, A2A_MAX_CTA_COUNT,
           /*lsa_multimem=*/false));
+#else
+  // CUDA: NCCLDevCommManager owns the device communicator (its host header can
+  // name ncclDevComm). Cached per (group, key); created on first use.
+  auto& manager = c10d::symmetric_memory::NCCLDevCommManager::get(device);
+  ncclComm_t comm = manager.get_comm(group_name);
+  static constexpr char const kDevcommKey[] = "nccl_all_to_all_nd";
+  auto devcomm_opt = manager.get_devcomm(group_name, kDevcommKey);
+  if (!devcomm_opt) {
+    ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    reqs.lsaBarrierCount = A2A_MAX_CTA_COUNT;
+    ncclDevComm devcomm;
+    C10D_NCCL_CHECK(
+        ncclDevCommCreate(comm, &reqs, &devcomm),
+        "ncclDevCommCreate failed in nccl_all_to_all_nd");
+    devcomm_opt = manager.register_devcomm(group_name, devcomm, kDevcommKey);
+  }
+  ncclDevComm& devcomm = devcomm_opt->get();
+#endif
 
   const int my_rank = devcomm.rank;
   const int p = devcomm.nRanks;

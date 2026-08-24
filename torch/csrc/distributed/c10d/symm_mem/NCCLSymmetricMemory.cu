@@ -18,6 +18,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/util/env.h>
 #include <c10/util/error.h>
 #include <mutex>
 #include <c10/util/flat_hash_map.h>
@@ -40,7 +41,13 @@ namespace symmetric_memory {
 constexpr size_t kFreeCacheByteBudget = 128UL * 1024 * 1024;
 #endif
 
-#if defined(NCCL_HAS_DEVCOMM_STORAGE)
+// This owned device-communicator cache exists only for ROCm: RCCL's
+// <nccl_device.h> is not host-compilable, so NCCLDevCommManager (a host-included
+// header) cannot store ncclDevComm on ROCm. On CUDA that header is host-safe, so
+// the ops use NCCLDevCommManager directly and this cache is never compiled in.
+// Gating on NCCL_HAS_LSA_PEER_PTR (RCCL >= 2.29.7, where ncclDevCommCreate exists)
+// keeps CUDA on the stub and off ncclDevCommCreate entirely.
+#if defined(NCCL_HAS_LSA_PEER_PTR)
 namespace {
 
 // Device communicators are owned here rather than in NCCLDevCommManager
@@ -100,7 +107,14 @@ void* get_or_create_nccl_devcomm(
   auto& cache = devcomm_cache();
   std::lock_guard<std::mutex> lock(cache.mutex);
   auto& entry = cache.by_device[device.index()][group_name][key];
-  if (entry.owner == nullptr) {
+  if (entry.owner != comm) {
+    // entry.owner == nullptr: first use for this (device, group, key).
+    // entry.owner != nullptr: a predecessor process group's stale devcomm
+    //   survived because its destructor was skipped (the host comm had
+    //   already aborted, so ~ProcessGroupNCCL took the isAborted() continue
+    //   and never released it). Rebuild for the current comm rather than
+    //   asserting. Do not ncclDevCommDestroy the stale one -- the aborted
+    //   comm reclaims its own resources (same rationale as release below).
     ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     reqs.lsaBarrierCount = lsa_barrier_count;
     reqs.lsaMultimem = lsa_multimem;
@@ -108,28 +122,43 @@ void* get_or_create_nccl_devcomm(
         ncclDevCommCreate(comm, &reqs, &entry.devcomm),
         "ncclDevCommCreate failed");
     entry.owner = comm;
-  } else {
-    TORCH_INTERNAL_ASSERT(
-        entry.owner == comm,
-        "stale device communicator for group ", group_name);
   }
   return &entry.devcomm;
 }
 
 void release_nccl_devcomms_for_group(
     const c10::Device& device,
-    const std::string& group_name) {
+    const std::string& group_name,
+    void* comm) {
+  auto* owner = static_cast<ncclComm_t>(comm);
   auto& cache = devcomm_cache();
   std::lock_guard<std::mutex> lock(cache.mutex);
   auto dev_it = cache.by_device.find(device.index());
   if (dev_it == cache.by_device.end()) {
     return;
   }
-  // Erase without ncclDevCommDestroy: kernels from other streams may still
-  // reference the communicator at teardown time. The owning communicator
-  // reclaims the resources; only process-exit survivors need explicit
-  // destruction (see ~NcclDevCommCache).
-  dev_it->second.erase(group_name);
+  auto group_it = dev_it->second.find(group_name);
+  if (group_it == dev_it->second.end()) {
+    return;
+  }
+  // Identity-safe: erase only entries this comm owns. A stale destructor whose
+  // comm was already replaced by a successor under the same group name (e.g.
+  // restart-after-error) leaves the successor's entries untouched. Erase
+  // without ncclDevCommDestroy: kernels from other streams may still reference
+  // the communicator at teardown time; the owning comm reclaims the resources,
+  // and only process-exit survivors need explicit destruction (see
+  // ~NcclDevCommCache).
+  auto& keys = group_it->second;
+  for (auto it = keys.begin(); it != keys.end();) {
+    if (it->second.owner == owner) {
+      it = keys.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (keys.empty()) {
+    dev_it->second.erase(group_it);
+  }
 }
 #else
 
@@ -141,12 +170,16 @@ void* get_or_create_nccl_devcomm(
     bool /*lsa_multimem*/) {
   TORCH_CHECK(
       false,
-      "NCCL device communicators require NCCL >= 2.29 or RCCL >= 2.29.7");
+      "NCCL device communicators via the owned cache are ROCm-only "
+      "(RCCL >= 2.29.7); CUDA uses NCCLDevCommManager.");
 }
 
-void release_nccl_devcomms_for_group(const c10::Device&, const std::string&) {}
+void release_nccl_devcomms_for_group(
+    const c10::Device&,
+    const std::string&,
+    void*) {}
 
-#endif // NCCL_HAS_DEVCOMM_STORAGE
+#endif // NCCL_HAS_LSA_PEER_PTR
 
 /* Start of NCCLAllocation implementation */
 
@@ -320,6 +353,20 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
         "been eagerly initialized by filling `device_id` in the "
         "`init_process_group` call.");
 
+#ifdef USE_ROCM
+    // RCCL symmetric-memory windows require VMM (cuMem) and window
+    // registration, both disabled by default in RCCL. RCCL reads these at
+    // ncclCommInitRank -- before symm_mem is ever requested -- so they cannot
+    // be enabled from here; fail with actionable guidance instead of letting
+    // ncclCommWindowRegister fail confusingly deep inside RCCL.
+    TORCH_CHECK(
+        c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&
+            c10::utils::check_env("NCCL_WIN_ENABLE") == true,
+        "RCCL symmetric memory requires NCCL_CUMEM_ENABLE=1 and "
+        "NCCL_WIN_ENABLE=1 to be set in the environment before "
+        "init_process_group. Set both and re-run.");
+#endif
+
     // Register a single window over the combined signal pad + buffer region.
     // Layout inside the registration (signal pad first):
     //   [0, signal_pad_size)                          - signal pad
@@ -328,9 +375,17 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
     // for the data sub-region: only the base pointer (returned by
     // ncclMemAlloc, already granularity-aligned) is registered.
     const size_t aligned_buffer_size = at::round_up(buffer_size_, 16UL);
+#ifdef USE_ROCM
+    // RCCL additionally requires the registered window size to be a multiple of
+    // NCCL_WIN_REQUIRED_ALIGNMENT. Upstream NCCL only constrains the base
+    // offset, so keep the size round-up ROCm-only to avoid changing CUDA
+    // allocation and registration sizes.
     const size_t total_size = at::round_up(
         buffer_offset_ + aligned_buffer_size,
         static_cast<size_t>(NCCL_WIN_REQUIRED_ALIGNMENT));
+#else
+    const size_t total_size = buffer_offset_ + aligned_buffer_size;
+#endif
     C10D_NCCL_CHECK(
       ncclCommWindowRegister(comm_, allocation->alloc_base, total_size, &combined_win_, NCCL_WIN_COLL_SYMMETRIC),
       c10::str(
@@ -487,22 +542,29 @@ std::vector<void*> NCCLSymmetricMemory::get_signal_pad_ptrs() {
   return pai_->signal_pads_;
 }
 
-// The dev-side pointer tables are only populated when the peer-pointer API
-// exists (CUDA >= 2.28 device API, or RCCL >= 2.29.7 LSA). Ops that launch
-// kernels reading these tables would otherwise dereference null/garbage on
-// intermediate versions where only the host-side window registration exists.
+#ifdef USE_ROCM
+// On ROCm the dev-side pointer tables are only populated at RCCL >= 2.29.7 (LSA
+// peer-pointer API). Ops that launch kernels reading these tables would
+// otherwise dereference null/garbage on intermediate RCCL versions where only
+// the host-side window registration exists. CUDA populates the tables whenever
+// symmetric memory is available, so it keeps the plain accessor (unchanged).
 static constexpr const char* kPeerPtrsUnavailable =
     "device-side peer pointer tables were not populated; symmetric-memory "
-    "peer access requires every peer to be reachable over the LSA/NVLink "
-    "domain and NCCL >= 2.28 (RCCL >= 2.29.7)";
+    "peer access requires every peer to be reachable over the LSA domain and "
+    "RCCL >= 2.29.7";
+#endif
 
 void** NCCLSymmetricMemory::get_buffer_ptrs_dev() {
+#ifdef USE_ROCM
   TORCH_CHECK(pai_->buffers_dev_ != nullptr, kPeerPtrsUnavailable);
+#endif
   return pai_->buffers_dev_;
 }
 
 void** NCCLSymmetricMemory::get_signal_pad_ptrs_dev() {
+#ifdef USE_ROCM
   TORCH_CHECK(pai_->signal_pads_dev_ != nullptr, kPeerPtrsUnavailable);
+#endif
   return pai_->signal_pads_dev_;
 }
 
@@ -709,9 +771,16 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
     const size_t buffer_offset =
         at::round_up(get_signal_pad_size(), signal_pad_alignment);
     const size_t aligned_buffer_size = at::round_up(size, 16UL);
+#ifdef USE_ROCM
+    // RCCL requires the registered window size (== this allocation size) to be
+    // a multiple of NCCL_WIN_REQUIRED_ALIGNMENT; upstream NCCL does not, so the
+    // round-up stays ROCm-only to keep CUDA allocation sizes unchanged.
     const size_t total_size = at::round_up(
         buffer_offset + aligned_buffer_size,
         static_cast<size_t>(NCCL_WIN_REQUIRED_ALIGNMENT));
+#else
+    const size_t total_size = buffer_offset + aligned_buffer_size;
+#endif
 
 #ifdef USE_ROCM
     const bool in_capture =

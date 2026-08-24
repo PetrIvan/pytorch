@@ -1615,11 +1615,10 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
   LOG(INFO) << logPrefix() << "ProcessGroupNCCL destructor entered.";
 
 #ifdef NCCL_HAS_SYMMEM_SUPPORT
-  // Drop our entry from each per-device NCCLDevCommManager. The
-  // identity-safe overload only erases when the entry still holds OUR comm,
-  // so a stale destructor (e.g. after restart-after-error, where a successor
-  // PG re-registered under the same group name) becomes a no-op instead of
-  // silently wiping the successor's entry.
+  // Drop our entry from each per-device NCCLDevCommManager. Skip aborted
+  // comms -- a successor PG may have already re-registered under the same
+  // group_uid (e.g. restart-after-error), and unconditionally clearing
+  // would silently wipe the successor's entry.
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [_, ncclComm] : devNCCLCommMap_) {
@@ -1629,12 +1628,20 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
       c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
       const std::string symmMemGroupName =
           options_->group_name.empty() ? "0" : options_->group_name;
+#ifdef NCCL_HAS_LSA_PEER_PTR
+      // ROCm: the device communicators live in the symm-mem owned cache (RCCL
+      // cannot store ncclDevComm in this host TU). Use the identity-safe
+      // unregister and release so a stale destructor after restart-after-error
+      // leaves a successor registered under the same name untouched.
       c10d::symmetric_memory::NCCLDevCommManager::get(device).unregister_comm(
           symmMemGroupName, ncclComm->getNcclComm());
-      // Drop any device communicators the symm-mem ops created for this
-      // group so a successor group under the same name starts clean.
       c10d::symmetric_memory::release_nccl_devcomms_for_group(
-          device, symmMemGroupName);
+          device, symmMemGroupName, ncclComm->getNcclComm());
+#else
+      // CUDA: NCCLDevCommManager owns the device communicators.
+      c10d::symmetric_memory::NCCLDevCommManager::get(device).unregister_comm(
+          symmMemGroupName);
+#endif
     }
   }
 #endif
