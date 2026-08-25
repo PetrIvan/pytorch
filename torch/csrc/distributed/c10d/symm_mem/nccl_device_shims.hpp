@@ -32,9 +32,8 @@ static __device__ __forceinline__ unsigned int __vadd4(
 }
 
 #if defined(__HIP_NO_HALF_OPERATORS__)
-static __device__ __forceinline__ __half operator+(
-    const __half& a,
-    const __half& b) {
+static __device__ __forceinline__ __half
+operator+(const __half& a, const __half& b) {
   return __float2half(__half2float(a) + __half2float(b));
 }
 #endif

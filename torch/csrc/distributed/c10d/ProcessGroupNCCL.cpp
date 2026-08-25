@@ -929,8 +929,7 @@ void ProcessGroupNCCL::WorkNCCL::abort() {
     auto* raw = ncclComm_->getNcclComm();
     c10d::symmetric_memory::NCCLDevCommManager::get(device_).unregister_comm(
         name, raw);
-    c10d::symmetric_memory::invalidate_symm_mem_for_comm(
-        device_, name, raw);
+    c10d::symmetric_memory::invalidate_symm_mem_for_comm(device_, name, raw);
     c10d::symmetric_memory::release_nccl_devcomms_for_group(device_, name, raw);
   }
 #endif

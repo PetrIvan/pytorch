@@ -1598,9 +1598,7 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
             unretained_tensor = symm_mem.empty(
                 numel + 1, dtype=torch.float32, device=self.device
             )
-            unretained_handle = symm_mem.rendezvous(
-                unretained_tensor, group=group_name
-            )
+            unretained_handle = symm_mem.rendezvous(unretained_tensor, group=group_name)
             unretained_handle.barrier()
             del unretained_handle
 

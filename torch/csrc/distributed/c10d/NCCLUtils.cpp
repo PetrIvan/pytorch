@@ -1,8 +1,8 @@
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 
 #ifdef USE_C10D_NCCL
-#include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_cache.hpp>
 #include <fmt/format.h>
+#include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_cache.hpp>
 #include <mutex>
 #include <thread>
 #include <vector>
