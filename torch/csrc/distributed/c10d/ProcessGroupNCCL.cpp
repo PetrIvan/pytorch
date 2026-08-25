@@ -1628,14 +1628,6 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
       c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
       const std::string symmMemGroupName =
           options_->group_name.empty() ? "0" : options_->group_name;
-#ifdef USE_ROCM
-      // Drop this comm's RCCL precondition snapshot. Keyed by comm, so it only
-      // clears our own entry; aborted comms are skipped above (getNcclComm()
-      // throws on them), same as the device-comm release, and a successor's
-      // distinct comm cannot match any lingering entry at lookup time.
-      c10d::symmetric_memory::forget_rccl_symm_precondition(
-          ncclComm->getNcclComm());
-#endif
 #ifdef NCCL_HAS_LSA_PEER_PTR
       // ROCm: the device communicators live in the symm-mem owned cache (RCCL
       // cannot store ncclDevComm in this host TU). Use the identity-safe
@@ -1651,6 +1643,19 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
           symmMemGroupName);
 #endif
     }
+#ifdef USE_ROCM
+    // Forget every RCCL precondition snapshot this PG recorded. Keyed by the
+    // raw ncclComm_t saved at note time, so this runs regardless of abort state
+    // -- the loop above is skipped for aborted comms, and by the time the
+    // destructor runs on the normal destroy_process_group path shutdown() has
+    // already destroyed (and poisoned getNcclComm() on) every comm. Forgetting
+    // by the saved handle keeps a reused ncclComm_t address from inheriting a
+    // dead comm's value.
+    for (ncclComm_t noted : symmMemNotedComms_) {
+      c10d::symmetric_memory::forget_rccl_symm_precondition(noted);
+    }
+    symmMemNotedComms_.clear();
+#endif
   }
 #endif
 
@@ -3349,6 +3354,9 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
         ncclComm->getNcclComm(),
         c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&
             c10::utils::check_env("NCCL_WIN_ENABLE") == true);
+    // Save the raw handle so ~ProcessGroupNCCL can forget the snapshot without
+    // getNcclComm() (which throws once the comm is destroyed/aborted).
+    symmMemNotedComms_.push_back(ncclComm->getNcclComm());
 #endif
 #endif
   }

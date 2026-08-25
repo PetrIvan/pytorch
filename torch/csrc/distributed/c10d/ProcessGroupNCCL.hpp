@@ -1358,6 +1358,14 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // TODO: we probably need a separate map for P2P comms
   std::unordered_map<std::string, std::shared_ptr<NCCLComm>> devNCCLCommMap_;
 
+#ifdef USE_ROCM
+  // Raw host comms for which this PG recorded an RCCL symm-mem precondition
+  // snapshot (see note_rccl_symm_precondition). Saved at note time so
+  // ~ProcessGroupNCCL can forget the snapshots without calling getNcclComm(),
+  // which throws once shutdown()/abort() has destroyed the communicator.
+  std::vector<ncclComm_t> symmMemNotedComms_;
+#endif
+
   // The NCCL communicators currently in process of being initialized.
   std::unordered_map<std::string, std::shared_ptr<NCCLComm>>
       inInitializationCommMap_;
