@@ -281,7 +281,6 @@ class TestDropoutAlignRandomEager(InductorTestCase):
     # multiple dropouts + multiple iterations
     # ───────────────────────────────────────────────────────────
     def test_multi_dropout_multi_iterations_parity(self, device):
-
         eager = MultiDropoutBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
         compiled = MultiDropoutBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
         compiled.load_state_dict(eager.state_dict())
@@ -312,7 +311,6 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         "https://github.com/pytorch/pytorch/issues/190237"
     )
     def test_dropout_parity_dynamic_shapes(self, device):
-
         eager = LinearBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
         compiled = LinearBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
         compiled.load_state_dict(eager.state_dict())
@@ -345,7 +343,6 @@ class TestDropoutAlignRandomEager(InductorTestCase):
         "https://github.com/pytorch/pytorch/issues/190237"
     )
     def test_dropout_parity_cudagraphs_reduce_overhead(self, device):
-
         eager = LinearBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
         compiled = LinearBlock(HIDDEN_DIM, FFN_DIM, DROPOUT_P).to(device)
         compiled.load_state_dict(eager.state_dict())
