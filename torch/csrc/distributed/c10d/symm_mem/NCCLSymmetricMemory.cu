@@ -554,6 +554,18 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
     }
   }
 
+  // The host communicator this info's window was registered on.
+  ncclComm_t host_comm() const {
+    return comm_;
+  }
+
+  // Detach the window so ~NCCLPeerAllocInfo skips ncclCommWindowDeregister.
+  // Used when the owning communicator has been destroyed (the window died with
+  // it), so deregistering would touch a dead comm.
+  void abandon_window() {
+    combined_win_ = nullptr;
+  }
+
  private:
   size_t buffer_size_;
   // Byte offset from the allocation base to the start of the user buffer; the
@@ -1033,6 +1045,25 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
     std::lock_guard<std::mutex> alloc_lock(allocation->mutex);
     auto& peer_alloc_infos = allocation->peer_alloc_infos_;
     auto& pai = peer_alloc_infos[*group_name];
+#ifdef USE_ROCM
+    // On ROCm the free-block cache retains peer alloc infos across free(), so a
+    // same-name process-group restart could otherwise reuse a window registered
+    // on the now-destroyed communicator. Compare against the live host comm --
+    // get_comm() throws "not found" once the owning PG has torn down (its
+    // registration is dropped in shutdown()/abort() before the comm is freed).
+    // If the comm changed under us, abandon the dead window (skip its
+    // deregister) and rebuild for the current comm.
+    if (pai) {
+      auto* live_comm =
+          NCCLDevCommManager::get(
+              c10::Device(c10::DeviceType::CUDA, allocation->device_idx))
+              .get_comm(*group_name);
+      if (pai->host_comm() != live_comm) {
+        pai->abandon_window();
+        pai.reset();
+      }
+    }
+#endif
     if (!pai) {
 #ifdef USE_ROCM
       TORCH_CHECK(

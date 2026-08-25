@@ -279,7 +279,10 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
         cls.pg = c10d.distributed_c10d._get_default_group()
 
     @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
-    @requires_nccl_version((2, 27), "NCCL Symmetric Memory support from nccl 2.27")
+    @requires_nccl_version(
+        (2, 29, 7) if TEST_WITH_ROCM else (2, 27),
+        "NCCL/RCCL symmetric-memory API version requirement",
+    )
     @skip_if_lt_x_gpu(2)
     def test_nccl_symmem_alloc(self):
         symm_mem.set_backend("NCCL")
@@ -1511,6 +1514,104 @@ class NCCLSymmetricMemoryWinDisabledTest(MultiProcContinuousTest):
             RuntimeError, r"NCCL_CUMEM_ENABLE=1 and NCCL_WIN_ENABLE=1"
         ):
             symm_mem.rendezvous(tensor, group=group_name)
+
+
+@requires_cuda_p2p_access()
+@skip_but_pass_in_sandcastle_if(
+    not TEST_WITH_ROCM,
+    "ROCm-only: the free-block cache that retains peer alloc infos is USE_ROCM",
+)
+@skip_but_pass_in_sandcastle_if(
+    TEST_WITH_ROCM and getRocmVersion() == (7, 14),
+    "RCCL CUMEM/P2P communicator init fails on ROCm 7.14 (p2p_tmp.cc:358)",
+)
+class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
+    """The ROCm free-block cache must not outlive its communicator.
+
+    free() moves a block and its peer alloc info (window + host comm) into the
+    ROCm free cache. A same-name process-group restart must rebuild the info on
+    the live communicator rather than recycle a window registered on the
+    destroyed one -- otherwise the destructor deregisters on a dangling comm.
+    Isolated in its own class because it tears down and re-inits the default PG.
+    """
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda", self.rank)
+
+    @classmethod
+    def _init_pg(cls, rank, world_size, rdvz_file):
+        if rdvz_file is None:
+            raise AssertionError("Expected rdvz_file to not be None")
+        os.environ["LOCAL_RANK"] = str(rank)
+        if TEST_WITH_ROCM:
+            os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+            os.environ.setdefault("NCCL_WIN_ENABLE", "1")
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        store = c10d.FileStore(rdvz_file, world_size)
+        c10d.init_process_group(
+            backend="nccl",
+            world_size=world_size,
+            rank=rank,
+            store=store,
+            timeout=cls.timeout,
+            device_id=device,
+        )
+        cls.pg = c10d.distributed_c10d._get_default_group()
+
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_free_cache_restart_rebuilds_window(self):
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        numel = 4096
+        tensor = symm_mem.empty(numel, dtype=torch.float32, device=self.device)
+        symm_mem.rendezvous(tensor, group=group_name).barrier()
+        ptr = tensor.data_ptr()
+        # free(): the block and its peer alloc info move into the free cache.
+        del tensor
+        torch.cuda.synchronize(self.device)
+
+        # Tear down the default group. shutdown() unregisters + releases the
+        # symm-mem device comms while the host comm is still alive, so the
+        # cached window's comm is now dead.
+        c10d.destroy_process_group()
+
+        # Re-init the default group under a fresh store (same rank layout, same
+        # "0" symm-mem group name).
+        restart_file = type(self).rdvz_file + "_symmem_restart"
+        store = c10d.FileStore(restart_file, self.world_size)
+        c10d.init_process_group(
+            backend="nccl",
+            world_size=self.world_size,
+            rank=self.rank,
+            store=store,
+            timeout=type(self).timeout,
+            device_id=self.device,
+        )
+        type(self).pg = c10d.distributed_c10d._get_default_group()
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        new_group_name = c10d.group.WORLD.group_name
+
+        # Same-size empty() hits the free cache (same pointer), carrying the
+        # stale peer alloc info. rendezvous must rebuild it on the live comm.
+        reused = symm_mem.empty(numel, dtype=torch.float32, device=self.device)
+        self.assertEqual(reused.data_ptr(), ptr)
+        handle = symm_mem.rendezvous(reused, group=new_group_name)
+        reused.fill_(self.rank)
+        torch.cuda.synchronize(self.device)
+        handle.barrier()
+        peer_rank = (self.rank + 1) % self.world_size
+        buf = handle.get_buffer(peer_rank, (numel,), torch.float32)
+        self.assertTrue(buf.eq(peer_rank).all())
+        del handle
 
 
 instantiate_device_type_tests(TestNCCL, globals(), only_for="cuda")

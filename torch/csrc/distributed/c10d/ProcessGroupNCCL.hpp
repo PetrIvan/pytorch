@@ -1239,13 +1239,20 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // communicators from the cache and clears used device indices.
   void destroyNCCLComms(const std::string& devNCCLCommMapKey);
 
-#ifdef USE_ROCM
-  // Forget the RCCL symm-mem precondition snapshots this PG recorded, then
-  // clear the saved handles. Must be called with mutex_ held while the
-  // communicators are still alive (i.e. before ncclCommDestroy/Abort), so a
-  // later destructor cannot erase a successor's entry via a reused ncclComm_t
-  // address.
-  void forgetSymmMemPreconditions();
+  // The group name symmetric memory keys its per-comm registry by: the PG's
+  // group name, or "0" when unset (matches the register_comm call in
+  // initNCCLComm).
+  std::string symmMemGroupName() const {
+    return options_->group_name.empty() ? "0" : options_->group_name;
+  }
+
+#ifdef NCCL_HAS_LSA_PEER_PTR
+  // ROCm: unregister a host comm from NCCLDevCommManager and release its owned
+  // device communicators. Must be called with mutex_ held while the comm is
+  // still alive (before ncclCommDestroy/Abort), so a later same-name PG sees
+  // get_comm() throw (rather than a dead handle) and the symm-mem free cache
+  // cannot recycle a window registered on the destroyed communicator.
+  void releaseSymmMemForComm(const std::shared_ptr<NCCLComm>& ncclComm);
 #endif
 
   void runHookLoop();
@@ -1366,14 +1373,6 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // multiple GPUs per process, this part may need to redesigned.
   // TODO: we probably need a separate map for P2P comms
   std::unordered_map<std::string, std::shared_ptr<NCCLComm>> devNCCLCommMap_;
-
-#ifdef USE_ROCM
-  // Raw host comms for which this PG recorded an RCCL symm-mem precondition
-  // snapshot (see note_rccl_symm_precondition). Saved at note time so
-  // ~ProcessGroupNCCL can forget the snapshots without calling getNcclComm(),
-  // which throws once shutdown()/abort() has destroyed the communicator.
-  std::vector<ncclComm_t> symmMemNotedComms_;
-#endif
 
   // The NCCL communicators currently in process of being initialized.
   std::unordered_map<std::string, std::shared_ptr<NCCLComm>>

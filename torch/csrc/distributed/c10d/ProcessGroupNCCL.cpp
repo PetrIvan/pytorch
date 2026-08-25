@@ -917,6 +917,22 @@ void ProcessGroupNCCL::WorkNCCL::abort() {
   printNcclCommProxyTrace("WorkNCCL::abort", dumpMap);
 #endif // USE_ROCM && NCCL_COMM_DUMP
 
+#ifdef NCCL_HAS_LSA_PEER_PTR
+  // ROCm: the wait/timeout error path (synchronizeInternal -> abort()) aborts
+  // this comm but keeps the process group alive, so unregister + release the
+  // symm-mem device communicators here, before ncclCommAbort frees the handle.
+  // Otherwise get_comm() keeps returning the dead handle and a same-name reuse
+  // recycles a window bound to it. The snapshot is forgotten inside
+  // NCCLComm::abort(). The group name must match register (empty -> "0").
+  if (ncclComm_ && !ncclComm_->isAborted()) {
+    const std::string name = pgUID_.empty() ? "0" : pgUID_;
+    auto* raw = ncclComm_->getNcclComm();
+    c10d::symmetric_memory::NCCLDevCommManager::get(device_).unregister_comm(
+        name, raw);
+    c10d::symmetric_memory::release_nccl_devcomms_for_group(device_, name, raw);
+  }
+#endif
+
   // Abort all communicators of this work
   ncclComm_->abort();
 
@@ -1497,10 +1513,13 @@ bool ProcessGroupNCCL::abortComms(
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-#ifdef USE_ROCM
-  // Forget the precondition snapshots before ncclCommAbort frees these comms,
-  // for the same reused-ncclComm_t reason as in shutdown().
-  forgetSymmMemPreconditions();
+#ifdef NCCL_HAS_LSA_PEER_PTR
+  // ROCm: unregister + release the symm-mem device communicators before
+  // ncclCommAbort frees them (same reused-ncclComm_t reason as shutdown()).
+  // The snapshot is forgotten inside NCCLComm::abort().
+  for (auto& [_, ncclComm] : devNCCLCommMap_) {
+    releaseSymmMemForComm(ncclComm);
+  }
 #endif
   abortCommsFromMap(devNCCLCommMap_, abortReason);
   abortCommsFromMap(inInitializationCommMap_, abortReason);
@@ -1607,26 +1626,34 @@ void ProcessGroupNCCL::shutdown() {
   LOG(INFO) << logPrefix() << "Watchdog joined, destroying NCCL communicators.";
   {
     std::lock_guard<std::mutex> lock(mutex_);
-#ifdef USE_ROCM
-    // Forget the precondition snapshots before ncclCommDestroy frees these
-    // comms: a later PG can reuse a freed ncclComm_t address, and erasing by
-    // that pointer afterwards would wipe the successor's entry.
-    forgetSymmMemPreconditions();
-#endif
     for (auto& it : devNCCLCommMap_) {
       auto& ncclComm = it.second;
+#ifdef NCCL_HAS_LSA_PEER_PTR
+      // ROCm: unregister + release the symm-mem device communicators while the
+      // host comm is still alive, so a same-name successor PG sees get_comm()
+      // throw instead of a dead handle (and the free cache cannot recycle a
+      // window bound to the destroyed comm). The snapshot itself is forgotten
+      // inside NCCLComm::destroy().
+      releaseSymmMemForComm(ncclComm);
+#endif
       ncclComm->destroy();
     }
   }
   LOG(INFO) << logPrefix() << "Destroy complete.";
 }
 
-#ifdef USE_ROCM
-void ProcessGroupNCCL::forgetSymmMemPreconditions() {
-  for (ncclComm_t noted : symmMemNotedComms_) {
-    c10d::symmetric_memory::forget_rccl_symm_precondition(noted);
+#ifdef NCCL_HAS_LSA_PEER_PTR
+void ProcessGroupNCCL::releaseSymmMemForComm(
+    const std::shared_ptr<NCCLComm>& ncclComm) {
+  if (!ncclComm || ncclComm->isAborted()) {
+    return;
   }
-  symmMemNotedComms_.clear();
+  c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
+  const std::string name = symmMemGroupName();
+  auto* raw = ncclComm->getNcclComm();
+  c10d::symmetric_memory::NCCLDevCommManager::get(device).unregister_comm(
+      name, raw);
+  c10d::symmetric_memory::release_nccl_devcomms_for_group(device, name, raw);
 }
 #endif
 
@@ -1645,30 +1672,18 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
       if (!ncclComm || ncclComm->isAborted()) {
         continue;
       }
-      c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
-      const std::string symmMemGroupName =
-          options_->group_name.empty() ? "0" : options_->group_name;
 #ifdef NCCL_HAS_LSA_PEER_PTR
-      // ROCm: the device communicators live in the symm-mem owned cache (RCCL
-      // cannot store ncclDevComm in this host TU). Use the identity-safe
-      // unregister and release so a stale destructor after restart-after-error
-      // leaves a successor registered under the same name untouched.
-      c10d::symmetric_memory::NCCLDevCommManager::get(device).unregister_comm(
-          symmMemGroupName, ncclComm->getNcclComm());
-      c10d::symmetric_memory::release_nccl_devcomms_for_group(
-          device, symmMemGroupName, ncclComm->getNcclComm());
+      // ROCm, destructor-only path (shutdown()/abort() never ran, so the comms
+      // are still alive): identity-safe unregister + release. The snapshot is
+      // forgotten inside NCCLComm::destroy()/abort().
+      releaseSymmMemForComm(ncclComm);
 #else
       // CUDA: NCCLDevCommManager owns the device communicators.
+      c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
       c10d::symmetric_memory::NCCLDevCommManager::get(device).unregister_comm(
-          symmMemGroupName);
+          symmMemGroupName());
 #endif
     }
-#ifdef USE_ROCM
-    // Destructor-only path: shutdown()/abort() were never called, so the comms
-    // are still alive and their handles have not been reused. Forget now (a
-    // no-op if shutdown()/abort() already forgot and cleared these).
-    forgetSymmMemPreconditions();
-#endif
   }
 #endif
 
@@ -3353,11 +3368,9 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
     // registry, giving symm_mem a uniform group_name -> ncclComm_t lookup
     // regardless of backend. Gated on NCCL_HAS_SYMMEM_SUPPORT so host-side
     // symmetric-memory users on CUDA and ROCm can consume the entry.
-    // Unregistered in ~ProcessGroupNCCL.
-    const std::string symmMemGroupName =
-        options_->group_name.empty() ? "0" : options_->group_name;
+    // Unregistered in shutdown()/abortComms()/~ProcessGroupNCCL.
     c10d::symmetric_memory::NCCLDevCommManager::get(device).register_comm(
-        symmMemGroupName, ncclComm->getNcclComm());
+        symmMemGroupName(), ncclComm->getNcclComm());
 #ifdef USE_ROCM
     // RCCL samples NCCL_CUMEM_ENABLE / NCCL_WIN_ENABLE here, inside
     // ncclCommInitRank. Snapshot them now so the symm-mem rendezvous path can
@@ -3367,14 +3380,6 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
         ncclComm->getNcclComm(),
         c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&
             c10::utils::check_env("NCCL_WIN_ENABLE") == true);
-    // Save the raw handle so shutdown()/abort()/~ProcessGroupNCCL can forget
-    // the snapshot without getNcclComm() (which throws once the comm is
-    // destroyed or aborted). Guard with mutex_ since a concurrent abort()
-    // thread reads and clears this via forgetSymmMemPreconditions().
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      symmMemNotedComms_.push_back(ncclComm->getNcclComm());
-    }
 #endif
 #endif
   }
