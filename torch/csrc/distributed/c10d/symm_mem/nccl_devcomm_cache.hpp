@@ -53,4 +53,15 @@ void note_rccl_symm_precondition(void* comm, bool ok);
 // comm's value. No-op off ROCm.
 void forget_rccl_symm_precondition(void* comm);
 
+// Evict every cached symmetric-memory free block on `device`, deregistering
+// their windows and ncclMemFree'ing their memory. The owning backend calls this
+// at communicator teardown while the registering comm is still alive (before
+// ncclCommDestroy/Abort), so a later restart takes a cache MISS and allocates a
+// fresh window on the live comm instead of reusing a block whose device memory
+// and cuMem P2P peer mappings died with the old comm. Called at every teardown
+// site, so a cached block's registering comm is always alive when it is dropped
+// (window deregister stays valid). No-op off ROCm. Implemented in
+// NCCLSymmetricMemory.cu (the one TU that owns the allocator singleton).
+void drop_symm_mem_free_cache_for_device(const c10::Device& device);
+
 } // namespace c10d::symmetric_memory

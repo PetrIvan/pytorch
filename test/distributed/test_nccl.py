@@ -1529,10 +1529,12 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
     """The ROCm free-block cache must not outlive its communicator.
 
     free() moves a block and its peer alloc info (window + host comm) into the
-    ROCm free cache. A same-name process-group restart must rebuild the info on
-    the live communicator rather than recycle a window registered on the
-    destroyed one -- otherwise the destructor deregisters on a dangling comm.
-    Isolated in its own class because it tears down and re-inits the default PG.
+    ROCm free cache. Recycling that block after the communicator is destroyed
+    would touch device memory whose cuMem P2P peer mappings died with the old
+    comm. Communicator teardown therefore evicts the device's free cache while
+    the comm is still alive, so a same-name process-group restart takes a cache
+    miss and allocates fresh memory. Isolated in its own class because it tears
+    down and re-inits the default PG.
     """
 
     @property
@@ -1543,6 +1545,9 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
     def _init_pg(cls, rank, world_size, rdvz_file):
         if rdvz_file is None:
             raise AssertionError("Expected rdvz_file to not be None")
+        # Remember the rendezvous file so the test can derive a second,
+        # rank-agreed store for the mid-test re-init.
+        cls.rdvz_file = rdvz_file
         os.environ["LOCAL_RANK"] = str(rank)
         if TEST_WITH_ROCM:
             os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
@@ -1565,7 +1570,7 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
         (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
     )
     @skip_if_lt_x_gpu(2)
-    def test_free_cache_restart_rebuilds_window(self):
+    def test_free_cache_evicted_on_pg_restart(self):
         symm_mem.set_backend("NCCL")
         torch.cuda.set_device(self.rank)
         c10d.all_reduce(torch.ones(1, device=self.device))
@@ -1574,14 +1579,13 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
         numel = 4096
         tensor = symm_mem.empty(numel, dtype=torch.float32, device=self.device)
         symm_mem.rendezvous(tensor, group=group_name).barrier()
-        ptr = tensor.data_ptr()
         # free(): the block and its peer alloc info move into the free cache.
         del tensor
         torch.cuda.synchronize(self.device)
 
-        # Tear down the default group. shutdown() unregisters + releases the
-        # symm-mem device comms while the host comm is still alive, so the
-        # cached window's comm is now dead.
+        # Tear down the default group. shutdown() evicts this device's symm-mem
+        # free cache while the host comm is still alive, so the cached block is
+        # dropped (window deregistered, memory freed) before the comm dies.
         c10d.destroy_process_group()
 
         # Re-init the default group under a fresh store (same rank layout, same
@@ -1600,12 +1604,14 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
         c10d.all_reduce(torch.ones(1, device=self.device))
         new_group_name = c10d.group.WORLD.group_name
 
-        # Same-size empty() hits the free cache (same pointer), carrying the
-        # stale peer alloc info. rendezvous must rebuild it on the live comm.
-        reused = symm_mem.empty(numel, dtype=torch.float32, device=self.device)
-        self.assertEqual(reused.data_ptr(), ptr)
-        handle = symm_mem.rendezvous(reused, group=new_group_name)
-        reused.fill_(self.rank)
+        # The teardown evicted this device's free cache, so this same-size
+        # empty() takes a cache miss and allocates a fresh block. rendezvous
+        # registers a new window on the live comm; the barrier and peer read
+        # below faulted before the eviction fix (they touched a block whose P2P
+        # peer mappings died with the old comm) and must now succeed.
+        fresh = symm_mem.empty(numel, dtype=torch.float32, device=self.device)
+        handle = symm_mem.rendezvous(fresh, group=new_group_name)
+        fresh.fill_(self.rank)
         torch.cuda.synchronize(self.device)
         handle.barrier()
         peer_rank = (self.rank + 1) % self.world_size

@@ -1117,6 +1117,29 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
     return "NCCL";
   }
 
+#ifdef USE_ROCM
+  // Drop every cached free block for `device_idx`: erasing each vector runs
+  // ~NCCLAllocation (ncclMemFree + window deregister via the peer alloc infos).
+  // Callers invoke this at communicator teardown while the registering comm is
+  // still alive, so the deregister is valid. Consistent eviction at every
+  // teardown means a cached block's comm cannot have been destroyed while the
+  // block is still cached, so a restart never reuses a window bound to a dead
+  // comm; it takes a cache miss and re-registers on the live comm instead.
+  void drop_free_cache_for_device(int device_idx) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = free_cache_.begin(); it != free_cache_.end();) {
+      if (it->first.device_idx == device_idx) {
+        for (const auto& block : it->second) {
+          free_cache_bytes_ -= block->buffer_offset + block->buffer_size;
+        }
+        it = free_cache_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+#endif // USE_ROCM
+
  private:
 #ifdef USE_ROCM
   // Exact user size and signal-pad layout are part of the key. Different
@@ -1186,9 +1209,16 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
   NCCLSymmMemKeysByAlloc symm_mem_keys_by_alloc_;
 };
 
+// The process-wide NCCL symmetric-memory allocator singleton. Kept as a raw
+// pointer so drop_symm_mem_free_cache_for_device() can reach its free cache;
+// the intrusive_ptr held by the allocator registry keeps it alive for the
+// process lifetime.
+static NCCLSymmetricMemoryAllocator* nccl_symm_allocator_ = nullptr;
+
 struct RegisterNCCLSymmetricMemoryAllocator {
     RegisterNCCLSymmetricMemoryAllocator() {
     auto allocator = c10::make_intrusive<NCCLSymmetricMemoryAllocator>();
+    nccl_symm_allocator_ = allocator.get();
     // Query backend used for CUDA tensor
     if (getSymmMemBackendCUDA() == "NCCL") {
       // Direct set (static registration)
@@ -1203,6 +1233,17 @@ struct RegisterNCCLSymmetricMemoryAllocator {
 };
 
 static RegisterNCCLSymmetricMemoryAllocator register_allocator_;
+
+void drop_symm_mem_free_cache_for_device(const c10::Device& device) {
+#ifdef USE_ROCM
+  if (nccl_symm_allocator_ != nullptr) {
+    nccl_symm_allocator_->drop_free_cache_for_device(
+        static_cast<int>(device.index()));
+  }
+#else
+  (void)device;
+#endif
+}
 
 } // namespace symmetric_memory
 } // namespace c10d
