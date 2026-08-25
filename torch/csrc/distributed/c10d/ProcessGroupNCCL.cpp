@@ -1497,6 +1497,11 @@ bool ProcessGroupNCCL::abortComms(
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
+#ifdef USE_ROCM
+  // Forget the precondition snapshots before ncclCommAbort frees these comms,
+  // for the same reused-ncclComm_t reason as in shutdown().
+  forgetSymmMemPreconditions();
+#endif
   abortCommsFromMap(devNCCLCommMap_, abortReason);
   abortCommsFromMap(inInitializationCommMap_, abortReason);
   return true;
@@ -1602,6 +1607,12 @@ void ProcessGroupNCCL::shutdown() {
   LOG(INFO) << logPrefix() << "Watchdog joined, destroying NCCL communicators.";
   {
     std::lock_guard<std::mutex> lock(mutex_);
+#ifdef USE_ROCM
+    // Forget the precondition snapshots before ncclCommDestroy frees these
+    // comms: a later PG can reuse a freed ncclComm_t address, and erasing by
+    // that pointer afterwards would wipe the successor's entry.
+    forgetSymmMemPreconditions();
+#endif
     for (auto& it : devNCCLCommMap_) {
       auto& ncclComm = it.second;
       ncclComm->destroy();
@@ -1609,6 +1620,15 @@ void ProcessGroupNCCL::shutdown() {
   }
   LOG(INFO) << logPrefix() << "Destroy complete.";
 }
+
+#ifdef USE_ROCM
+void ProcessGroupNCCL::forgetSymmMemPreconditions() {
+  for (ncclComm_t noted : symmMemNotedComms_) {
+    c10d::symmetric_memory::forget_rccl_symm_precondition(noted);
+  }
+  symmMemNotedComms_.clear();
+}
+#endif
 
 // NOLINTNEXTLINE(bugprone-exception-escape)
 ProcessGroupNCCL::~ProcessGroupNCCL() {
@@ -1644,17 +1664,10 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
 #endif
     }
 #ifdef USE_ROCM
-    // Forget every RCCL precondition snapshot this PG recorded. Keyed by the
-    // raw ncclComm_t saved at note time, so this runs regardless of abort state
-    // -- the loop above is skipped for aborted comms, and by the time the
-    // destructor runs on the normal destroy_process_group path shutdown() has
-    // already destroyed (and poisoned getNcclComm() on) every comm. Forgetting
-    // by the saved handle keeps a reused ncclComm_t address from inheriting a
-    // dead comm's value.
-    for (ncclComm_t noted : symmMemNotedComms_) {
-      c10d::symmetric_memory::forget_rccl_symm_precondition(noted);
-    }
-    symmMemNotedComms_.clear();
+    // Destructor-only path: shutdown()/abort() were never called, so the comms
+    // are still alive and their handles have not been reused. Forget now (a
+    // no-op if shutdown()/abort() already forgot and cleared these).
+    forgetSymmMemPreconditions();
 #endif
   }
 #endif
@@ -3354,9 +3367,14 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
         ncclComm->getNcclComm(),
         c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&
             c10::utils::check_env("NCCL_WIN_ENABLE") == true);
-    // Save the raw handle so ~ProcessGroupNCCL can forget the snapshot without
-    // getNcclComm() (which throws once the comm is destroyed/aborted).
-    symmMemNotedComms_.push_back(ncclComm->getNcclComm());
+    // Save the raw handle so shutdown()/abort()/~ProcessGroupNCCL can forget
+    // the snapshot without getNcclComm() (which throws once the comm is
+    // destroyed or aborted). Guard with mutex_ since a concurrent abort()
+    // thread reads and clears this via forgetSymmMemPreconditions().
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      symmMemNotedComms_.push_back(ncclComm->getNcclComm());
+    }
 #endif
 #endif
   }

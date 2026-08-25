@@ -1239,6 +1239,15 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // communicators from the cache and clears used device indices.
   void destroyNCCLComms(const std::string& devNCCLCommMapKey);
 
+#ifdef USE_ROCM
+  // Forget the RCCL symm-mem precondition snapshots this PG recorded, then
+  // clear the saved handles. Must be called with mutex_ held while the
+  // communicators are still alive (i.e. before ncclCommDestroy/Abort), so a
+  // later destructor cannot erase a successor's entry via a reused ncclComm_t
+  // address.
+  void forgetSymmMemPreconditions();
+#endif
+
   void runHookLoop();
 
   // Generates a prefix that is unique to this process group and rank, for
