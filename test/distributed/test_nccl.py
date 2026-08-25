@@ -1526,15 +1526,13 @@ class NCCLSymmetricMemoryWinDisabledTest(MultiProcContinuousTest):
     "RCCL CUMEM/P2P communicator init fails on ROCm 7.14 (p2p_tmp.cc:358)",
 )
 class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
-    """The ROCm free-block cache must not outlive its communicator.
+    """ROCm cached allocations must not retain PAIs for dead communicators.
 
-    free() moves a block and its peer alloc info (window + host comm) into the
-    ROCm free cache. Recycling that block after the communicator is destroyed
-    would touch device memory whose cuMem P2P peer mappings died with the old
-    comm. Communicator teardown therefore evicts the device's free cache while
-    the comm is still alive, so a same-name process-group restart takes a cache
-    miss and allocates fresh memory. Isolated in its own class because it tears
-    down and re-inits the default PG.
+    The ncclMemAlloc block itself is communicator-independent and may be
+    recycled, but its old window and peer tables must be invalidated whether
+    the tensor is freed before or after communicator teardown. A same-name
+    successor must build a fresh PAI. Isolated in its own class because it
+    tears down and re-inits the default PG.
     """
 
     @property
@@ -1565,12 +1563,7 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
         )
         cls.pg = c10d.distributed_c10d._get_default_group()
 
-    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
-    @requires_nccl_version(
-        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
-    )
-    @skip_if_lt_x_gpu(2)
-    def test_free_cache_evicted_on_pg_restart(self):
+    def _run_restart(self, free_before_destroy):
         symm_mem.set_backend("NCCL")
         torch.cuda.set_device(self.rank)
         c10d.all_reduce(torch.ones(1, device=self.device))
@@ -1578,19 +1571,41 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
 
         numel = 4096
         tensor = symm_mem.empty(numel, dtype=torch.float32, device=self.device)
-        symm_mem.rendezvous(tensor, group=group_name).barrier()
-        # free(): the block and its peer alloc info move into the free cache.
-        del tensor
-        torch.cuda.synchronize(self.device)
+        old_handle = symm_mem.rendezvous(tensor, group=group_name)
+        old_handle.barrier()
+        unretained_tensor = None
+        if free_before_destroy:
+            # The block is already in the free cache when teardown invalidates
+            # and removes its communicator-scoped PAI.
+            del tensor
+            torch.cuda.synchronize(self.device)
+        else:
+            # Exercise teardown with an enqueued kernel whose PAI has no
+            # externally retained handle. Invalidation may destroy its device
+            # pointer tables, so shutdown must synchronize first.
+            unretained_tensor = symm_mem.empty(
+                numel + 1, dtype=torch.float32, device=self.device
+            )
+            unretained_handle = symm_mem.rendezvous(
+                unretained_tensor, group=group_name
+            )
+            unretained_handle.barrier()
+            del unretained_handle
 
-        # Tear down the default group. shutdown() evicts this device's symm-mem
-        # free cache while the host comm is still alive, so the cached block is
-        # dropped (window deregistered, memory freed) before the comm dies.
         c10d.destroy_process_group()
+        with self.assertRaisesRegex(RuntimeError, "destroyed communicator"):
+            old_handle.barrier()
+        if not free_before_destroy:
+            # Teardown invalidates only the live block's old PAI. The allocation
+            # itself remains safe to cache after free.
+            del unretained_tensor
+            del tensor
+            torch.cuda.synchronize(self.device)
 
         # Re-init the default group under a fresh store (same rank layout, same
         # "0" symm-mem group name).
-        restart_file = type(self).rdvz_file + "_symmem_restart"
+        order = "free_first" if free_before_destroy else "destroy_first"
+        restart_file = type(self).rdvz_file + f"_symmem_restart_{order}"
         store = c10d.FileStore(restart_file, self.world_size)
         c10d.init_process_group(
             backend="nccl",
@@ -1604,13 +1619,13 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
         c10d.all_reduce(torch.ones(1, device=self.device))
         new_group_name = c10d.group.WORLD.group_name
 
-        # The teardown evicted this device's free cache, so this same-size
-        # empty() takes a cache miss and allocates a fresh block. rendezvous
-        # registers a new window on the live comm; the barrier and peer read
-        # below faulted before the eviction fix (they touched a block whose P2P
-        # peer mappings died with the old comm) and must now succeed.
+        # The allocation may be recycled, but rendezvous must create peer
+        # metadata for the successor communicator.
         fresh = symm_mem.empty(numel, dtype=torch.float32, device=self.device)
         handle = symm_mem.rendezvous(fresh, group=new_group_name)
+        # A same-name successor must not make the predecessor handle usable.
+        with self.assertRaisesRegex(RuntimeError, "destroyed communicator"):
+            old_handle.barrier()
         fresh.fill_(self.rank)
         torch.cuda.synchronize(self.device)
         handle.barrier()
@@ -1618,6 +1633,59 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
         buf = handle.get_buffer(peer_rank, (numel,), torch.float32)
         self.assertTrue(buf.eq(peer_rank).all())
         del handle
+        del old_handle
+
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_free_cache_pai_refreshed_on_pg_restart(self):
+        self._run_restart(free_before_destroy=True)
+
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_live_allocation_pai_refreshed_on_pg_restart(self):
+        self._run_restart(free_before_destroy=False)
+
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_retained_handle_invalidated_on_cache_eviction(self):
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        # Four distinct cache keys total 134 MiB, exceeding the 128 MiB
+        # per-device budget and evicting the oldest allocation.
+        sizes_mib = (32, 33, 34, 35)
+        tensor = symm_mem.empty(
+            sizes_mib[0] * 1024 * 1024 // 4,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        old_handle = symm_mem.rendezvous(tensor, group=group_name)
+        old_handle.barrier()
+        torch.cuda.synchronize(self.device)
+        del tensor
+
+        for size_mib in sizes_mib[1:]:
+            tensor = symm_mem.empty(
+                size_mib * 1024 * 1024 // 4,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            del tensor
+        torch.cuda.synchronize(self.device)
+
+        with self.assertRaisesRegex(RuntimeError, "freed backing allocation"):
+            old_handle.barrier()
 
 
 instantiate_device_type_tests(TestNCCL, globals(), only_for="cuda")

@@ -1249,9 +1249,9 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // ROCm: unregister a host comm from NCCLDevCommManager and release its owned
   // device communicators. Must be called with mutex_ held while the comm is
   // still alive (before ncclCommDestroy/Abort), so a later same-name PG sees
-  // get_comm() throw (rather than a dead handle) and the symm-mem free cache
-  // cannot recycle a window registered on the destroyed communicator. Declared
-  // unconditionally (NCCL_HAS_LSA_PEER_PTR is not visible in this header before
+  // get_comm() throw (rather than a dead handle) and symm-mem allocations bound
+  // to the comm become non-cacheable. Declared unconditionally
+  // (NCCL_HAS_LSA_PEER_PTR is not visible in this header before
   // nccl_dev_cap.hpp is included); defined and called only under that macro, so
   // it is never ODR-used off ROCm.
   void releaseSymmMemForComm(const std::shared_ptr<NCCLComm>& ncclComm);

@@ -929,11 +929,9 @@ void ProcessGroupNCCL::WorkNCCL::abort() {
     auto* raw = ncclComm_->getNcclComm();
     c10d::symmetric_memory::NCCLDevCommManager::get(device_).unregister_comm(
         name, raw);
+    c10d::symmetric_memory::invalidate_symm_mem_for_comm(
+        device_, name, raw);
     c10d::symmetric_memory::release_nccl_devcomms_for_group(device_, name, raw);
-    // Evict this device's symm-mem free cache while the comm is still alive, so
-    // a restart re-allocates fresh memory instead of reusing a block whose
-    // device P2P peer mappings died with the aborted comm.
-    c10d::symmetric_memory::drop_symm_mem_free_cache_for_device(device_);
   }
 #endif
 
@@ -1638,6 +1636,15 @@ void ProcessGroupNCCL::shutdown() {
       // throw instead of a dead handle (and the free cache cannot recycle a
       // window bound to the destroyed comm). The snapshot itself is forgotten
       // inside NCCLComm::destroy().
+      // Symmetric-memory kernels are launched directly on user streams and
+      // have no ProcessGroup Work object for finalize()/waitReady() above to
+      // observe. Normal shutdown drains them before invalidation can destroy
+      // their PAI device-pointer tables or the host/device communicator. Abort
+      // paths intentionally remain non-blocking.
+      {
+        c10::cuda::CUDAGuard guard(ncclComm->getDeviceIndex());
+        C10_CUDA_CHECK(cudaDeviceSynchronize());
+      }
       releaseSymmMemForComm(ncclComm);
 #endif
       ncclComm->destroy();
@@ -1657,11 +1664,8 @@ void ProcessGroupNCCL::releaseSymmMemForComm(
   auto* raw = ncclComm->getNcclComm();
   c10d::symmetric_memory::NCCLDevCommManager::get(device).unregister_comm(
       name, raw);
+  c10d::symmetric_memory::invalidate_symm_mem_for_comm(device, name, raw);
   c10d::symmetric_memory::release_nccl_devcomms_for_group(device, name, raw);
-  // Evict this device's symm-mem free cache while the comm is still alive, so a
-  // restart re-allocates fresh memory instead of reusing a block whose device
-  // P2P peer mappings died with the comm.
-  c10d::symmetric_memory::drop_symm_mem_free_cache_for_device(device);
 }
 #endif
 

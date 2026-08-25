@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <c10/core/Device.h>
 #include <string>
 
@@ -16,14 +17,17 @@ namespace c10d::symmetric_memory {
 // a communicator built for its predecessor. Erased entries are reclaimed by
 // the communicator itself; survivors are destroyed at process exit.
 //
-// Returns a pointer to a cache-owned ncclDevComm; callers compiled against
-// <nccl_device.h> cast it to ncclDevComm*.
-void* get_or_create_nccl_devcomm(
+// Copies the cached ncclDevComm into caller-owned storage while holding the
+// cache lock. The opaque output keeps ncclDevComm out of host-only headers and
+// prevents teardown from invalidating a cache-owned reference at kernel launch.
+void get_or_create_nccl_devcomm(
     const c10::Device& device,
     const std::string& group_name,
     const std::string& key,
     int lsa_barrier_count,
-    bool lsa_multimem);
+    bool lsa_multimem,
+    void* devcomm_out,
+    size_t devcomm_size);
 
 // Identity-safe teardown: erase only the device communicators owned by `comm`
 // (the host ncclComm_t, passed as void* so this header stays free of NCCL
@@ -53,15 +57,13 @@ void note_rccl_symm_precondition(void* comm, bool ok);
 // comm's value. No-op off ROCm.
 void forget_rccl_symm_precondition(void* comm);
 
-// Evict every cached symmetric-memory free block on `device`, deregistering
-// their windows and ncclMemFree'ing their memory. The owning backend calls this
-// at communicator teardown while the registering comm is still alive (before
-// ncclCommDestroy/Abort), so a later restart takes a cache MISS and allocates a
-// fresh window on the live comm instead of reusing a block whose device memory
-// and cuMem P2P peer mappings died with the old comm. Called at every teardown
-// site, so a cached block's registering comm is always alive when it is dropped
-// (window deregister stays valid). No-op off ROCm. Implemented in
-// NCCLSymmetricMemory.cu (the one TU that owns the allocator singleton).
-void drop_symm_mem_free_cache_for_device(const c10::Device& device);
+// Invalidate and remove only PAIs whose peer mappings were created by `comm`.
+// The communicator-independent ncclMemAlloc blocks and PAIs for other groups
+// remain reusable. The owning backend calls this before ncclCommDestroy/Abort.
+// No-op off ROCm. Implemented in NCCLSymmetricMemory.cu.
+void invalidate_symm_mem_for_comm(
+    const c10::Device& device,
+    const std::string& group_name,
+    void* comm);
 
 } // namespace c10d::symmetric_memory

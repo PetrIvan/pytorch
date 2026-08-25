@@ -177,10 +177,15 @@ void nccl_all_to_all_nd(
   // cannot name ncclDevComm in host TUs). Entries die with the owning process
   // group, so a recreated group can never reuse a predecessor's communicator.
   static constexpr char const kDevcommKey[] = "nccl_all_to_all_nd";
-  ncclDevComm& devcomm = *static_cast<ncclDevComm*>(
-      c10d::symmetric_memory::get_or_create_nccl_devcomm(
-          device, group_name, kDevcommKey, A2A_MAX_CTA_COUNT,
-          /*lsa_multimem=*/false));
+  ncclDevComm devcomm;
+  c10d::symmetric_memory::get_or_create_nccl_devcomm(
+      device,
+      group_name,
+      kDevcommKey,
+      A2A_MAX_CTA_COUNT,
+      /*lsa_multimem=*/false,
+      &devcomm,
+      sizeof(devcomm));
 #else
   // CUDA: NCCLDevCommManager owns the device communicator (its host header can
   // name ncclDevComm). Cached per (group, key); created on first use.

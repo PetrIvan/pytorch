@@ -225,9 +225,15 @@ void nccl_reduce_scatter_offset(
   static constexpr char const kDevcommKeyLsa[] =
       "nccl_reduce_scatter_offset_lsa";
   const char* devcomm_key = use_multimem ? kDevcommKeyMultimem : kDevcommKeyLsa;
-  ncclDevComm& devcomm = *static_cast<ncclDevComm*>(
-      c10d::symmetric_memory::get_or_create_nccl_devcomm(
-          device, group_name, devcomm_key, RS_MAX_CTA_COUNT, use_multimem));
+  ncclDevComm devcomm;
+  c10d::symmetric_memory::get_or_create_nccl_devcomm(
+      device,
+      group_name,
+      devcomm_key,
+      RS_MAX_CTA_COUNT,
+      use_multimem,
+      &devcomm,
+      sizeof(devcomm));
 #else
   // CUDA: NCCLDevCommManager owns the device communicator (its host header can
   // name ncclDevComm). Cached per (group, key); created on first use.

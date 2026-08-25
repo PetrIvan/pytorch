@@ -32,6 +32,10 @@ class TORCH_API NCCLSymmetricMemory : public SymmetricMemory {
 
   ~NCCLSymmetricMemory() override = default;
 
+  // Internal identity check used by the allocator before returning a cached
+  // handle while communicator teardown may be in progress.
+  bool is_live_for(ncclComm_t comm) const;
+
   std::vector<void*> get_buffer_ptrs() override;
 
   std::vector<void*> get_signal_pad_ptrs() override;
