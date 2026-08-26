@@ -217,6 +217,10 @@ void FunctionalTensorWrapper::mutate_view_meta(const std::shared_ptr<at::functio
 void FunctionalTensorWrapper::replace_(const Tensor& other, bool from_lazy_regenerate) {
   // TODO: going to need to change this if we want nested functionalize() transforms.
   TORCH_INTERNAL_ASSERT(!at::functionalization::impl::isFunctionalTensor(other));
+  if (!from_lazy_regenerate) {
+    // A value that did not come from regenerate_from_base cannot be a cheap replay.
+    regenerated_single_output_ = false;
+  }
   value_ = other;
   TORCH_INTERNAL_ASSERT(!value_.key_set().has(c10::DispatchKey::Functionalize));
   // out= ops are allowed to resize the output tensors, mutating both the data and metadata of the tensor.
@@ -260,6 +264,10 @@ void FunctionalTensorWrapper::set__impl(const FunctionalTensorWrapper* other) {
   generation_ = other->generation_;
   view_metas_ = other->view_metas_;
   is_symbolic_ = other->is_symbolic_;
+  // Must travel with view_metas_: the flag says whether that chain contains a
+  // multi-output view, and _unwrap_functional_tensor now uses it to decide
+  // between an exact and a cheap replay.
+  is_multi_output_view_ = other->is_multi_output_view_;
   // FREEZE the old storage, preventing mutations to it.
   // this is a huge pain to handle properly in all cases, so we ban it.
   functional_storage_impl()->freeze();
@@ -363,23 +371,25 @@ void FunctionalTensorWrapper::sync_() {
     return;
   }
   apply_updates();
-  regenerate_from_base();
+  regenerate_from_base(/*single_output_replay=*/true);
 }
 
 const std::vector<std::shared_ptr<functionalization::ViewMeta>>& FunctionalTensorWrapper::view_metas() const {
   return view_metas_;
 }
 
-void FunctionalTensorWrapper::regenerate_from_base() {
+void FunctionalTensorWrapper::regenerate_from_base(bool single_output_replay) {
   at::AutoDispatchSkipFunctionalize guard;
   auto storage_impl = functional_storage_impl();
   auto t = storage_impl->base();
 
   TORCH_INTERNAL_ASSERT(!at::functionalization::impl::isFunctionalTensor(t));
-  t = at::functionalization::impl::apply_view_meta_sequence(t, view_metas_);
+  t = at::functionalization::impl::apply_view_meta_sequence(
+      t, view_metas_, single_output_replay);
   TORCH_INTERNAL_ASSERT(!at::functionalization::impl::isFunctionalTensor(t));
 
   replace_(t, /*from_lazy_regenerate=*/true);
+  regenerated_single_output_ = single_output_replay;
   generation_ = storage_impl->generation();
 }
 
@@ -792,10 +802,11 @@ void mutate_view_meta(const at::Tensor& self, const std::shared_ptr<functionaliz
 
 Tensor apply_view_meta_sequence(
     const Tensor& base,
-    const std::vector<std::shared_ptr<functionalization::ViewMeta>>& sequence) {
+    const std::vector<std::shared_ptr<functionalization::ViewMeta>>& sequence,
+    bool single_output_replay) {
   Tensor r = base;
   for (auto& vm : sequence) {
-    r = vm->forward(r);
+    r = single_output_replay ? vm->forward_single_output(r) : vm->forward(r);
   }
   return r;
 }
