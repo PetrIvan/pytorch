@@ -1550,8 +1550,7 @@ bool ProcessGroupNCCL::abortComms(
       continue;
     }
     c10d::symmetric_memory::close_symm_mem_for_comm(ncclComm->getNcclComm());
-    releaseSymmMemForComm(
-        ncclComm, /*reclaimDeviceTables=*/false);
+    releaseSymmMemForComm(ncclComm, /*reclaimDeviceTables=*/false);
   }
 #endif
   abortCommsFromMap(devNCCLCommMap_, abortReason);
@@ -1687,9 +1686,7 @@ void ProcessGroupNCCL::shutdown() {
         continue;
       }
       symmMemCommsToTeardown.push_back(
-          {ncclComm->getDeviceIndex(),
-           ncclComm->getNcclComm(),
-           ncclComm});
+          {ncclComm->getDeviceIndex(), ncclComm->getNcclComm(), ncclComm});
     }
   }
 
@@ -1699,9 +1696,7 @@ void ProcessGroupNCCL::shutdown() {
     bool drained = false;
     const bool usedSymmMem =
         c10d::symmetric_memory::begin_symm_mem_teardown_for_comm(
-            entry.rawComm,
-            symmMemDrainTimeout,
-            &drained);
+            entry.rawComm, symmMemDrainTimeout, &drained);
     if (!usedSymmMem) {
       continue;
     }
@@ -1754,8 +1749,7 @@ void ProcessGroupNCCL::shutdown() {
               synchronizedSymmMemDevices.begin(),
               synchronizedSymmMemDevices.end(),
               ncclComm->getDeviceIndex()) != synchronizedSymmMemDevices.end();
-      releaseSymmMemForComm(
-          ncclComm, /*reclaimDeviceTables=*/deviceDrained);
+      releaseSymmMemForComm(ncclComm, /*reclaimDeviceTables=*/deviceDrained);
 #endif
       ncclComm->destroy();
     }
@@ -1807,8 +1801,7 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
       // are still alive): identity-safe unregister + release. The snapshot is
       // forgotten inside NCCLComm::destroy()/abort().
       c10d::symmetric_memory::close_symm_mem_for_comm(ncclComm->getNcclComm());
-      releaseSymmMemForComm(
-          ncclComm, /*reclaimDeviceTables=*/false);
+      releaseSymmMemForComm(ncclComm, /*reclaimDeviceTables=*/false);
 #else
       if (ncclComm->isAborted()) {
         continue;

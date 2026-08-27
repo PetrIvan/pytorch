@@ -1612,9 +1612,7 @@ class NCCLSymmetricMemoryShrinkTest(MultiProcContinuousTest):
         live_default = symm_mem.empty(
             64, dtype=torch.float32, device=self.device
         ).fill_(self.rank)
-        live_default_handle = symm_mem.rendezvous(
-            live_default, group=default_name
-        )
+        live_default_handle = symm_mem.rendezvous(live_default, group=default_name)
         live_default_handle.barrier()
         for peer in range(self.world_size):
             buf = live_default_handle.get_buffer(peer, (64,), torch.float32)
@@ -1627,9 +1625,7 @@ class NCCLSymmetricMemoryShrinkTest(MultiProcContinuousTest):
         final_default = symm_mem.empty(
             64, dtype=torch.float32, device=self.device
         ).fill_(self.rank + 10)
-        final_default_handle = symm_mem.rendezvous(
-            final_default, group=default_name
-        )
+        final_default_handle = symm_mem.rendezvous(final_default, group=default_name)
         final_default_handle.barrier()
         for peer in range(self.world_size):
             buf = final_default_handle.get_buffer(peer, (64,), torch.float32)
