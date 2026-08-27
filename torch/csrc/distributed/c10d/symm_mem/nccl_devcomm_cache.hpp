@@ -66,13 +66,9 @@ void forget_rccl_symm_precondition(void* comm);
 
 // Close admission for NCCL/RCCL symmetric-memory launches using `comm` and wait
 // for host threads that already acquired launch leases to finish enqueueing.
-// The lifecycle gate is communicator-wide; `device` and `group_name` are passed
-// for API symmetry with the invalidation path. Returns true if this communicator
-// had symmetric-memory state that should be drained before reclamation. No-op
-// off ROCm.
+// Returns true if this communicator had symmetric-memory state that should be
+// drained before reclamation. No-op off ROCm.
 bool begin_symm_mem_teardown_for_comm(
-    const c10::Device& device,
-    const std::string& group_name,
     void* comm,
     std::chrono::milliseconds timeout,
     bool* drained);
@@ -81,8 +77,6 @@ bool begin_symm_mem_teardown_for_comm(
 // wait for existing host enqueuers. The caller must retire, not reclaim, the
 // associated PAIs.
 bool close_symm_mem_for_comm(
-    const c10::Device& device,
-    const std::string& group_name,
     void* comm);
 
 // Invalidate and remove only PAIs whose peer mappings were created by `comm`.

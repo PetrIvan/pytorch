@@ -1681,6 +1681,18 @@ class ProcessGroupNCCLGroupTest(MultiProcessTestCase):
             "default",
         )
 
+    @requires_nccl()
+    @requires_world_size(2)
+    @skip_if_lt_x_gpu(2)
+    def test_initialized_comm_rejects_group_rename(self):
+        """Initialized NCCL comms cannot safely migrate registry keys."""
+        _, pg = self._setup_shrink_test("rename_rejected")
+
+        with self.assertRaisesRegex(RuntimeError, "changing a non-empty group name"):
+            pg._set_group_name("renamed_after_init")
+
+        dist.destroy_process_group()
+
     def _test_shrink_group_with_flag(self, shrink_flag, flag_name, rank_to_exclude):
         """Helper method to test shrink_group with a specific flag."""
         if self.world_size < 2:

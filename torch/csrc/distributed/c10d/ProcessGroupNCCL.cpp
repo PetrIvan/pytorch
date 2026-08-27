@@ -926,9 +926,9 @@ void ProcessGroupNCCL::WorkNCCL::abort() {
   // NCCLComm::abort(). Empty means the comm was never published.
   if (ncclComm_ && !ncclComm_->isAborted()) {
     const std::string name = pgUID_;
+    auto* raw = ncclComm_->getNcclComm();
+    c10d::symmetric_memory::close_symm_mem_for_comm(raw);
     if (!name.empty()) {
-      auto* raw = ncclComm_->getNcclComm();
-      c10d::symmetric_memory::close_symm_mem_for_comm(device_, name, raw);
       c10d::symmetric_memory::NCCLDevCommManager::get(device_).unregister_comm(
           name, raw);
       c10d::symmetric_memory::invalidate_symm_mem_for_comm(
@@ -1554,12 +1554,7 @@ bool ProcessGroupNCCL::abortComms(
     if (!ncclComm || ncclComm->isAborted()) {
       continue;
     }
-    c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
-    const std::string name = symmMemGroupName();
-    if (!name.empty()) {
-      c10d::symmetric_memory::close_symm_mem_for_comm(
-          device, name, ncclComm->getNcclComm());
-    }
+    c10d::symmetric_memory::close_symm_mem_for_comm(ncclComm->getNcclComm());
     releaseSymmMemForComm(
         ncclComm, /*reclaimDeviceTables=*/false);
   }
@@ -1676,7 +1671,9 @@ void ProcessGroupNCCL::shutdown() {
     std::shared_ptr<NCCLComm> ncclComm;
   };
   std::vector<SymmMemTeardownComm> symmMemCommsToTeardown;
+  std::vector<int> symmMemCandidateDevices;
   std::vector<int> symmMemDevicesToDrain;
+  std::vector<int> synchronizedSymmMemDevices;
   std::vector<int> undrainedSymmMemDevices;
   auto addDeviceIfMissing = [](std::vector<int>& devices, int deviceIndex) {
     if (std::find(devices.begin(), devices.end(), deviceIndex) ==
@@ -1687,7 +1684,11 @@ void ProcessGroupNCCL::shutdown() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [_, ncclComm] : devNCCLCommMap_) {
-      if (!ncclComm || ncclComm->isAborted()) {
+      if (!ncclComm) {
+        continue;
+      }
+      addDeviceIfMissing(symmMemCandidateDevices, ncclComm->getDeviceIndex());
+      if (ncclComm->isAborted()) {
         continue;
       }
       const std::string name = symmMemGroupName();
@@ -1702,20 +1703,24 @@ void ProcessGroupNCCL::shutdown() {
     }
   }
 
+  for (int deviceIndex : symmMemCandidateDevices) {
+    c10::Device device(at::kCUDA, deviceIndex);
+    if (c10d::symmetric_memory::has_retired_symm_mem_for_device(device)) {
+      addDeviceIfMissing(symmMemDevicesToDrain, deviceIndex);
+    }
+  }
+
+  const auto symmMemDrainTimeout =
+      std::min(options_->timeout, std::chrono::milliseconds(5000));
   for (const auto& entry : symmMemCommsToTeardown) {
     c10::Device device(at::kCUDA, entry.deviceIndex);
     bool drained = false;
     const bool usedSymmMem =
         c10d::symmetric_memory::begin_symm_mem_teardown_for_comm(
-            device,
-            entry.groupName,
             entry.rawComm,
-            options_->timeout,
+            symmMemDrainTimeout,
             &drained);
     if (!usedSymmMem) {
-      if (c10d::symmetric_memory::has_retired_symm_mem_for_device(device)) {
-        addDeviceIfMissing(symmMemDevicesToDrain, entry.deviceIndex);
-      }
       continue;
     }
     if (drained) {
@@ -1742,6 +1747,7 @@ void ProcessGroupNCCL::shutdown() {
       C10_CUDA_CHECK(cudaDeviceSynchronize());
       c10d::symmetric_memory::reclaim_retired_symm_mem_for_device(
           c10::Device(at::kCUDA, deviceIndex));
+      addDeviceIfMissing(synchronizedSymmMemDevices, deviceIndex);
     } catch (const std::exception& e) {
       LOG(WARNING) << logPrefix()
                    << "Failed to synchronize device before symmetric-memory "
@@ -1763,9 +1769,9 @@ void ProcessGroupNCCL::shutdown() {
 #ifdef NCCL_HAS_LSA_PEER_PTR
       const bool deviceDrained = ncclComm &&
           std::find(
-              undrainedSymmMemDevices.begin(),
-              undrainedSymmMemDevices.end(),
-              ncclComm->getDeviceIndex()) == undrainedSymmMemDevices.end();
+              synchronizedSymmMemDevices.begin(),
+              synchronizedSymmMemDevices.end(),
+              ncclComm->getDeviceIndex()) != synchronizedSymmMemDevices.end();
       releaseSymmMemForComm(
           ncclComm, /*reclaimDeviceTables=*/deviceDrained);
 #endif
@@ -1815,12 +1821,7 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
       // ROCm, destructor-only path (shutdown()/abort() never ran, so the comms
       // are still alive): identity-safe unregister + release. The snapshot is
       // forgotten inside NCCLComm::destroy()/abort().
-      c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
-      const std::string name = symmMemGroupName();
-      if (!name.empty()) {
-        c10d::symmetric_memory::close_symm_mem_for_comm(
-            device, name, ncclComm->getNcclComm());
-      }
+      c10d::symmetric_memory::close_symm_mem_for_comm(ncclComm->getNcclComm());
       releaseSymmMemForComm(
           ncclComm, /*reclaimDeviceTables=*/false);
 #else

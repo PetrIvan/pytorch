@@ -903,7 +903,6 @@ void* NCCLSymmetricMemory::get_multicast_ptr() {
 void NCCLSymmetricMemory::barrier(int channel, size_t timeout_ms) {
 #if defined(NCCL_HAS_SYMMEM_DEVICE_SUPPORT) || defined(NCCL_HAS_LSA_PEER_PTR)
   auto launch_guard = acquire_launch_guard();
-  pai_->check_live();
   TORCH_CHECK(
       pai_->signal_pads_dev_ != nullptr,
       "NCCLSymmetricMemory::barrier requires peer signal pad pointers, which "
@@ -930,7 +929,6 @@ void NCCLSymmetricMemory::barrier(int channel, size_t timeout_ms) {
 void NCCLSymmetricMemory::put_signal(int dst_rank, int channel, size_t timeout_ms) {
 #ifdef NCCL_HAS_ONE_SIDED_API
   auto launch_guard = acquire_launch_guard();
-  pai_->check_live();
   check_rank(dst_rank, world_size_);
   TORCH_CHECK(channel == 0, "channel must be 0 (sigIdx is reserved for future use)");
 
@@ -958,7 +956,6 @@ void NCCLSymmetricMemory::put_signal(int dst_rank, int channel, size_t timeout_m
 void NCCLSymmetricMemory::wait_signal(int src_rank, int channel, size_t timeout_ms) {
 #ifdef NCCL_HAS_ONE_SIDED_API
   auto launch_guard = acquire_launch_guard();
-  pai_->check_live();
   check_rank(src_rank, world_size_);
   TORCH_CHECK(channel == 0, "channel must be 0 (sigIdx is reserved for future use)");
 
@@ -1029,7 +1026,6 @@ static constexpr const char* kHostCftHint =
 NCCLCftHandle NCCLSymmetricMemory::get_peer_cft_handle(int peer) {
 #ifdef NCCL_HAS_HOST_CFT
   auto launch_guard = acquire_launch_guard();
-  pai_->check_live();
   TORCH_CHECK(
       peer >= 0 && peer < world_size_,
       "NCCLSymmetricMemory::get_peer_cft_handle: invalid peer ",
@@ -1052,7 +1048,6 @@ NCCLCftHandle NCCLSymmetricMemory::get_peer_cft_handle(int peer) {
 NCCLCftHandle NCCLSymmetricMemory::get_multimem_cft_handle() {
 #ifdef NCCL_HAS_HOST_CFT
   auto launch_guard = acquire_launch_guard();
-  pai_->check_live();
   // Unlike the unicast query, this one may still have to bind the multicast
   // team (and barrier over the group) if the endpoint wasn't created eagerly.
   c10::cuda::CUDAGuard guard(device_idx_);
@@ -1202,9 +1197,8 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       if (alloc_it == allocations_.end()) {
         return;
       }
-      nccl_alloc = std::move(alloc_it->second);
+      nccl_alloc = alloc_it->second;
       device_idx = nccl_alloc->device_idx;
-      allocations_.erase(alloc_it);
       // Drop the cached SymmetricMemory handles for this block so a
       // post-free rendezvous fails instead of returning a handle to memory
       // nobody owns. The peer alloc infos themselves stay alive inside
@@ -1213,39 +1207,38 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       // where re-registering a window is illegal -- still finds them without
       // any new NCCL calls.
       erase_symm_mem_handles(ptr);
-    }
 
-    bool in_capture = true;
-    try {
-      c10::cuda::CUDAGuard guard(device_idx);
-      in_capture = c10::cuda::currentStreamCaptureStatusMayInitCtx() !=
-          c10::cuda::CaptureStatus::None;
-      if (!in_capture) {
-        // Best-effort cleanup for graph-capture reuse. Failures make the cached
-        // block dirty instead of throwing through tensor storage destruction.
-        auto err = cudaMemset(
-            nccl_alloc->alloc_base, 0, nccl_alloc->buffer_offset);
-        if (err == cudaSuccess) {
-          nccl_alloc->signal_pad_clean = true;
+      bool in_capture = true;
+      try {
+        c10::cuda::CUDAGuard guard(device_idx);
+        in_capture = c10::cuda::currentStreamCaptureStatusMayInitCtx() !=
+            c10::cuda::CaptureStatus::None;
+        if (!in_capture) {
+          // Best-effort cleanup for graph-capture reuse. Failures make the
+          // cached block dirty instead of throwing through tensor storage
+          // destruction.
+          auto err = cudaMemset(
+              nccl_alloc->alloc_base, 0, nccl_alloc->buffer_offset);
+          if (err == cudaSuccess) {
+            nccl_alloc->signal_pad_clean = true;
+          } else {
+            LOG(WARNING) << "Failed to zero NCCL symmetric-memory signal pad: "
+                         << cudaGetErrorString(err);
+            nccl_alloc->signal_pad_clean = false;
+          }
         } else {
-          LOG(WARNING) << "Failed to zero NCCL symmetric-memory signal pad: "
-                       << cudaGetErrorString(err);
           nccl_alloc->signal_pad_clean = false;
         }
-      } else {
+      } catch (const std::exception& e) {
+        LOG(WARNING) << "Failed to query/clean NCCL symmetric-memory free block: "
+                     << e.what();
+        nccl_alloc->signal_pad_clean = false;
+      } catch (...) {
+        LOG(WARNING) << "Failed to query/clean NCCL symmetric-memory free block";
         nccl_alloc->signal_pad_clean = false;
       }
-    } catch (const std::exception& e) {
-      LOG(WARNING) << "Failed to query/clean NCCL symmetric-memory free block: "
-                   << e.what();
-      nccl_alloc->signal_pad_clean = false;
-    } catch (...) {
-      LOG(WARNING) << "Failed to query/clean NCCL symmetric-memory free block";
-      nccl_alloc->signal_pad_clean = false;
-    }
 
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
+      allocations_.erase(alloc_it);
       FreeCacheKey cache_key{
           nccl_alloc->buffer_size,
           nccl_alloc->buffer_offset,
@@ -1630,14 +1623,10 @@ struct RegisterNCCLSymmetricMemoryAllocator {
 static RegisterNCCLSymmetricMemoryAllocator register_allocator_;
 
 bool begin_symm_mem_teardown_for_comm(
-    const c10::Device& device,
-    const std::string& group_name,
     void* comm,
     std::chrono::milliseconds timeout,
     bool* drained) {
 #ifdef USE_ROCM
-  (void)device;
-  (void)group_name;
   if (drained != nullptr) {
     *drained = false;
   }
@@ -1654,8 +1643,6 @@ bool begin_symm_mem_teardown_for_comm(
   }
   return true;
 #else
-  (void)device;
-  (void)group_name;
   (void)comm;
   (void)timeout;
   if (drained != nullptr) {
@@ -1665,13 +1652,8 @@ bool begin_symm_mem_teardown_for_comm(
 #endif
 }
 
-bool close_symm_mem_for_comm(
-    const c10::Device& device,
-    const std::string& group_name,
-    void* comm) {
+bool close_symm_mem_for_comm(void* comm) {
 #ifdef USE_ROCM
-  (void)device;
-  (void)group_name;
   auto lifecycle = find_symm_mem_lifecycle(static_cast<ncclComm_t>(comm));
   if (!lifecycle) {
     return false;
@@ -1680,8 +1662,6 @@ bool close_symm_mem_for_comm(
   lifecycle->closing = true;
   return true;
 #else
-  (void)device;
-  (void)group_name;
   (void)comm;
   return false;
 #endif

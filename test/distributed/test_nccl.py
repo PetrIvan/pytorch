@@ -1870,19 +1870,6 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
         with self.assertRaisesRegex(RuntimeError, "freed backing allocation"):
             old_handle.barrier()
 
-    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
-    @requires_nccl_version(
-        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
-    )
-    @skip_if_lt_x_gpu(2)
-    def test_initialized_comm_rejects_group_rename(self):
-        symm_mem.set_backend("NCCL")
-        torch.cuda.set_device(self.rank)
-        c10d.all_reduce(torch.ones(1, device=self.device))
-
-        with self.assertRaisesRegex(RuntimeError, "changing a non-empty group name"):
-            c10d.group.WORLD._set_group_name("renamed_after_init")
-
 
 def _host_cft_unsupported_reason() -> str | None:
     """Python mirror of NCCL's runtime gate for CFT logical endpoints
