@@ -1486,6 +1486,16 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
     }
     reclaimed_pais.clear();
   }
+
+  bool has_retired_for_device(int device_idx) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::any_of(
+        retired_pais_.begin(),
+        retired_pais_.end(),
+        [&](const c10::intrusive_ptr<NCCLPeerAllocInfo>& pai) {
+          return pai->device_idx() == device_idx;
+        });
+  }
 #endif // USE_ROCM
 
  private:
@@ -1696,6 +1706,17 @@ void invalidate_symm_mem_for_comm(
   (void)group_name;
   (void)comm;
   (void)reclaim_device_tables;
+#endif
+}
+
+bool has_retired_symm_mem_for_device(const c10::Device& device) {
+#ifdef USE_ROCM
+  return nccl_symm_allocator_ != nullptr &&
+      nccl_symm_allocator_->has_retired_for_device(
+          static_cast<int>(device.index()));
+#else
+  (void)device;
+  return false;
 #endif
 }
 

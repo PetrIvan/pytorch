@@ -1264,9 +1264,11 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   // get_comm() throw (rather than a dead handle) and symm-mem allocations bound
   // to the comm become non-cacheable. Defined and called only when RCCL exposes
   // LSA peer pointers, so it is never ODR-used off that path.
+#ifdef NCCL_HAS_LSA_PEER_PTR
   void releaseSymmMemForComm(
       const std::shared_ptr<NCCLComm>& ncclComm,
       bool reclaimDeviceTables);
+#endif
 
   void runHookLoop();
 

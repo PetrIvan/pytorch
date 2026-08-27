@@ -66,8 +66,10 @@ void forget_rccl_symm_precondition(void* comm);
 
 // Close admission for NCCL/RCCL symmetric-memory launches using `comm` and wait
 // for host threads that already acquired launch leases to finish enqueueing.
-// Returns true if this communicator had symmetric-memory state that should be
-// drained before reclamation. No-op off ROCm.
+// The lifecycle gate is communicator-wide; `device` and `group_name` are passed
+// for API symmetry with the invalidation path. Returns true if this communicator
+// had symmetric-memory state that should be drained before reclamation. No-op
+// off ROCm.
 bool begin_symm_mem_teardown_for_comm(
     const c10::Device& device,
     const std::string& group_name,
@@ -75,8 +77,9 @@ bool begin_symm_mem_teardown_for_comm(
     std::chrono::milliseconds timeout,
     bool* drained);
 
-// Abort-only close gate: reject future launches but do not wait for existing
-// host enqueuers. The caller must retire, not reclaim, the associated PAIs.
+// Abort-only communicator-wide close gate: reject future launches but do not
+// wait for existing host enqueuers. The caller must retire, not reclaim, the
+// associated PAIs.
 bool close_symm_mem_for_comm(
     const c10::Device& device,
     const std::string& group_name,
@@ -93,6 +96,10 @@ void invalidate_symm_mem_for_comm(
     const std::string& group_name,
     void* comm,
     bool reclaim_device_tables);
+
+// Returns true if an earlier no-drain teardown retired device pointer tables
+// for this device and a later device-wide synchronize can safely reclaim them.
+bool has_retired_symm_mem_for_device(const c10::Device& device);
 
 // Reclaim PAIs that were retired by an earlier abort/no-drain path once the
 // caller has since proven the device is idle with a device-wide synchronize.

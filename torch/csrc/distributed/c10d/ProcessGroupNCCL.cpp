@@ -1111,16 +1111,16 @@ ProcessGroupNCCL::ProcessGroupNCCL(
 
 void ProcessGroupNCCL::setGroupUid(const std::string& pg_uid) {
   const std::string oldGroupName = getGroupUid();
-  Backend::setGroupUid(pg_uid);
-  options_->group_name = pg_uid;
-
-#ifdef NCCL_HAS_SYMMEM_SUPPORT
   std::lock_guard<std::mutex> lock(mutex_);
   TORCH_CHECK(
       oldGroupName.empty() || oldGroupName == pg_uid || devNCCLCommMap_.empty(),
       "ProcessGroupNCCL does not support changing a non-empty group name after "
       "NCCL communicators have been initialized; create a new process group "
       "instead.");
+  Backend::setGroupUid(pg_uid);
+  options_->group_name = pg_uid;
+
+#ifdef NCCL_HAS_SYMMEM_SUPPORT
   for (auto& [_, ncclComm] : devNCCLCommMap_) {
     if (!ncclComm || ncclComm->isAborted()) {
       continue;
@@ -1672,6 +1672,7 @@ void ProcessGroupNCCL::shutdown() {
   struct SymmMemTeardownComm {
     int deviceIndex;
     std::string groupName;
+    void* rawComm;
     std::shared_ptr<NCCLComm> ncclComm;
   };
   std::vector<SymmMemTeardownComm> symmMemCommsToTeardown;
@@ -1694,7 +1695,10 @@ void ProcessGroupNCCL::shutdown() {
         continue;
       }
       symmMemCommsToTeardown.push_back(
-          {ncclComm->getDeviceIndex(), name, ncclComm});
+          {ncclComm->getDeviceIndex(),
+           name,
+           ncclComm->getNcclComm(),
+           ncclComm});
     }
   }
 
@@ -1705,10 +1709,13 @@ void ProcessGroupNCCL::shutdown() {
         c10d::symmetric_memory::begin_symm_mem_teardown_for_comm(
             device,
             entry.groupName,
-            entry.ncclComm->getNcclComm(),
+            entry.rawComm,
             options_->timeout,
             &drained);
     if (!usedSymmMem) {
+      if (c10d::symmetric_memory::has_retired_symm_mem_for_device(device)) {
+        addDeviceIfMissing(symmMemDevicesToDrain, entry.deviceIndex);
+      }
       continue;
     }
     if (drained) {

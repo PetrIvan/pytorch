@@ -1530,6 +1530,9 @@ class NCCLSymmetricMemoryWinDisabledTest(MultiProcContinuousTest):
 
 
 @requires_cuda_p2p_access()
+@skip_but_pass_in_sandcastle_if(
+    nGPUs < 3, "NCCL symmetric-memory shrink test requires 3+ GPUs"
+)
 @skipIfRocmVersionLessThan((10, 1))
 class NCCLSymmetricMemoryShrinkTest(MultiProcContinuousTest):
     @property
@@ -1715,8 +1718,8 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
             del tensor
             torch.cuda.synchronize(self.device)
 
-        # Re-init the default group under a fresh store (same rank layout, same
-        # "0" symm-mem group name).
+        # Re-init the default group under a fresh store with the same rank
+        # layout and the same finalized process-group name.
         order = "free_first" if free_before_destroy else "destroy_first"
         restart_file = type(self).rdvz_file + f"_symmem_restart_{order}"
         store = c10d.FileStore(restart_file, self.world_size)
@@ -1866,6 +1869,19 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
 
         with self.assertRaisesRegex(RuntimeError, "freed backing allocation"):
             old_handle.barrier()
+
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_initialized_comm_rejects_group_rename(self):
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+
+        with self.assertRaisesRegex(RuntimeError, "changing a non-empty group name"):
+            c10d.group.WORLD._set_group_name("renamed_after_init")
 
 
 def _host_cft_unsupported_reason() -> str | None:
