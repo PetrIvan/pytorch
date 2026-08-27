@@ -205,6 +205,7 @@ void nccl_reduce_scatter_offset(
   TORCH_CHECK(
       nccl_hdl != nullptr,
       "nccl_reduce_scatter_offset: requires NCCL symmetric memory backend");
+  auto launch_guard = nccl_hdl->acquire_launch_guard();
 
   c10::cuda::CUDAGuard guard(input.device());
   auto stream = at::cuda::getCurrentCUDAStream();

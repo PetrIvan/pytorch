@@ -167,6 +167,7 @@ void nccl_all_to_all_nd(
 
   auto* nccl_hdl = dynamic_cast<NCCLSymmetricMemory*>(symm_mem.get());
   TORCH_CHECK(nccl_hdl != nullptr, "nccl_all_to_all_nd: requires NCCL symmetric memory backend");
+  auto launch_guard = nccl_hdl->acquire_launch_guard();
 
   c10::cuda::CUDAGuard guard(input.device());
   auto stream = at::cuda::getCurrentCUDAStream();

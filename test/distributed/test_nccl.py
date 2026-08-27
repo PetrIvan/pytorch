@@ -28,6 +28,7 @@ from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     PLATFORM_SUPPORTS_SYMM_MEM,
     requires_nccl,
+    requires_nccl_shrink,
     requires_nccl_version,
     skip_if_lt_x_gpu,
 )
@@ -1529,6 +1530,108 @@ class NCCLSymmetricMemoryWinDisabledTest(MultiProcContinuousTest):
 
 
 @requires_cuda_p2p_access()
+@skipIfRocmVersionLessThan((10, 1))
+class NCCLSymmetricMemoryShrinkTest(MultiProcContinuousTest):
+    @property
+    def world_size(self):
+        return 3
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device("cuda", self.rank)
+
+    @classmethod
+    def _init_pg(cls, rank, world_size, rdvz_file):
+        if rdvz_file is None:
+            raise AssertionError("Expected rdvz_file to not be None")
+        os.environ["LOCAL_RANK"] = str(rank)
+        if TEST_WITH_ROCM:
+            os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+            os.environ.setdefault("NCCL_WIN_ENABLE", "1")
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        store = c10d.FileStore(rdvz_file, world_size)
+        c10d.init_process_group(
+            backend="nccl",
+            world_size=world_size,
+            rank=rank,
+            store=store,
+            timeout=cls.timeout,
+            device_id=device,
+        )
+        cls.pg = c10d.distributed_c10d._get_default_group()
+
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_shrink()
+    @requires_nccl_version(
+        (2, 29, 7) if TEST_WITH_ROCM else (2, 27),
+        "NCCL/RCCL symmetric-memory API version requirement",
+    )
+    @skip_if_lt_x_gpu(3)
+    @skip_but_pass_in_sandcastle_if(
+        not PLATFORM_SUPPORTS_SYMM_MEM, "SymmMem is not supported on this platform"
+    )
+    def test_shrink_group_symm_mem_registry(self):
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        default_name = c10d.group.WORLD.group_name
+
+        default_tensor = symm_mem.empty(
+            64, dtype=torch.float32, device=self.device
+        ).fill_(self.rank)
+        default_handle = symm_mem.rendezvous(default_tensor, group=default_name)
+        default_handle.barrier()
+
+        subgroup = c10d.new_group(list(range(self.world_size)))
+        c10d.all_reduce(torch.ones(1, device=self.device), group=subgroup)
+        ranks_to_exclude = [self.world_size - 1]
+        shrunk_pg = None
+
+        if self.rank in ranks_to_exclude:
+            c10d.destroy_process_group(subgroup)
+        else:
+            shrunk_pg = c10d.shrink_group(ranks_to_exclude, group=subgroup)
+            shrunk_tensor = symm_mem.empty(
+                64, dtype=torch.float32, device=self.device
+            ).fill_(self.rank)
+            shrunk_handle = symm_mem.rendezvous(
+                shrunk_tensor, group=shrunk_pg.group_name
+            )
+            shrunk_handle.barrier()
+            for peer in range(shrunk_pg.size()):
+                buf = shrunk_handle.get_buffer(peer, (64,), torch.float32)
+                self.assertTrue(buf.eq(peer).all())
+
+        c10d.barrier()
+        live_default = symm_mem.empty(
+            64, dtype=torch.float32, device=self.device
+        ).fill_(self.rank)
+        live_default_handle = symm_mem.rendezvous(
+            live_default, group=default_name
+        )
+        live_default_handle.barrier()
+        for peer in range(self.world_size):
+            buf = live_default_handle.get_buffer(peer, (64,), torch.float32)
+            self.assertTrue(buf.eq(peer).all())
+
+        if shrunk_pg is not None:
+            c10d.destroy_process_group(shrunk_pg)
+
+        c10d.barrier()
+        final_default = symm_mem.empty(
+            64, dtype=torch.float32, device=self.device
+        ).fill_(self.rank + 10)
+        final_default_handle = symm_mem.rendezvous(
+            final_default, group=default_name
+        )
+        final_default_handle.barrier()
+        for peer in range(self.world_size):
+            buf = final_default_handle.get_buffer(peer, (64,), torch.float32)
+            self.assertTrue(buf.eq(peer + 10).all())
+
+
+@requires_cuda_p2p_access()
 @skip_but_pass_in_sandcastle_if(
     not TEST_WITH_ROCM,
     "ROCm-only: the free-block cache that retains peer alloc infos is USE_ROCM",
@@ -1645,6 +1748,30 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
         del handle
         del old_handle
 
+    def _run_reduce_scatter_offset(self, group_name):
+        rows, cols = 64, 32
+        n_experts = self.world_size
+        rank_sum = float(sum(r + 1 for r in range(self.world_size)))
+
+        buf = symm_mem.empty(
+            n_experts * rows, cols, dtype=torch.float, device=self.device
+        )
+        for i in range(n_experts):
+            buf[i * rows : (i + 1) * rows, :] = float((self.rank + 1) * (i + 1))
+        handle = symm_mem.rendezvous(buf, group=group_name)
+
+        dst_ranks = [i % self.world_size for i in range(n_experts)]
+        out = [torch.zeros(rows, cols, dtype=torch.float, device=self.device)]
+        offsets = [i * rows for i in range(1, n_experts + 1)]
+        symm_mem.reduce_scatter_offset(
+            buf, out, group_name, dim=0, offsets=offsets, dst_ranks=dst_ranks
+        )
+        torch.cuda.synchronize(self.device)
+
+        expected = float(self.rank + 1) * rank_sum
+        self.assertEqual(out[0], torch.full_like(out[0], expected))
+        return buf, handle
+
     @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
     @requires_nccl_version(
         (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
@@ -1660,6 +1787,49 @@ class NCCLSymmetricMemoryRestartTest(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     def test_live_allocation_pai_refreshed_on_pg_restart(self):
         self._run_restart(free_before_destroy=False)
+
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_abort_restart_rebuilds_reduce_scatter_offset_devcomm(self):
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+
+        old_buf, old_handle = self._run_reduce_scatter_offset(group_name)
+        backend = type(self).pg._get_backend(self.device)
+        backend.abort()
+        c10d.destroy_process_group()
+
+        with self.assertRaisesRegex(RuntimeError, "destroyed communicator"):
+            old_handle.barrier()
+        del old_buf
+        torch.cuda.synchronize(self.device)
+
+        restart_file = type(self).rdvz_file + "_symmem_abort_restart"
+        store = c10d.FileStore(restart_file, self.world_size)
+        c10d.init_process_group(
+            backend="nccl",
+            world_size=self.world_size,
+            rank=self.rank,
+            store=store,
+            timeout=type(self).timeout,
+            device_id=self.device,
+        )
+        type(self).pg = c10d.distributed_c10d._get_default_group()
+        c10d.all_reduce(torch.ones(1, device=self.device))
+
+        new_group_name = c10d.group.WORLD.group_name
+        self.assertEqual(new_group_name, group_name)
+        fresh_buf, fresh_handle = self._run_reduce_scatter_offset(new_group_name)
+        with self.assertRaisesRegex(RuntimeError, "destroyed communicator"):
+            old_handle.barrier()
+        del fresh_handle
+        del fresh_buf
+        del old_handle
 
     @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
     @requires_nccl_version(

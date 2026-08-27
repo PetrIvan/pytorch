@@ -2,6 +2,7 @@
 
 #ifdef USE_C10D_NCCL
 #include <fmt/format.h>
+#include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_cache.hpp>
 #include <mutex>
 #include <thread>
@@ -351,7 +352,7 @@ void NCCLComm::destroy() {
   }
   at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
   auto comm = getNcclComm();
-#ifdef USE_ROCM
+#if defined(USE_ROCM) && defined(NCCL_HAS_SYMMEM_SUPPORT)
   // Forget the RCCL symm-mem precondition snapshot keyed by this host comm
   // while the handle is still live -- ncclCommDestroy frees it and a reused
   // address must not inherit a dead comm's value. No-op off ROCm.
@@ -402,7 +403,7 @@ void NCCLComm::abort(std::optional<std::string> commFailureReason) {
   LOG(INFO) << "Aborting ncclComm_ " << ncclComm_ << " with reason: "
             << (commFailureReason ? *commFailureReason
                                   : "No abort reason provided.");
-#ifdef USE_ROCM
+#if defined(USE_ROCM) && defined(NCCL_HAS_SYMMEM_SUPPORT)
   // Forget the RCCL symm-mem precondition snapshot keyed by this host comm
   // before ncclCommAbort frees it (and before ncclComm_ is nulled below), so a
   // reused ncclComm_t address cannot inherit a dead comm's value. No-op off
