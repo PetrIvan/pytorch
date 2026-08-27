@@ -1536,7 +1536,6 @@ class NCCLSymmetricMemoryWinDisabledTest(MultiProcContinuousTest):
 @skip_but_pass_in_sandcastle_if(
     nGPUs < 3, "NCCL symmetric-memory shrink test requires 3+ GPUs"
 )
-@skipIfRocmVersionLessThan((10, 1))
 class NCCLSymmetricMemoryShrinkTest(MultiProcContinuousTest):
     @property
     def world_size(self):

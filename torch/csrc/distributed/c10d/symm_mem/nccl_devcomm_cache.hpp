@@ -1,10 +1,10 @@
 #pragma once
 
 #include <c10/core/Device.h>
+#include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
 #include <chrono>
 #include <cstddef>
 #include <string>
-#include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
 
 namespace c10d::symmetric_memory {
 
@@ -78,8 +78,7 @@ bool begin_symm_mem_teardown_for_comm(
 // Abort-only communicator-wide close gate: reject future launches but do not
 // wait for existing host enqueuers. The caller must retire, not reclaim, the
 // associated PAIs.
-bool close_symm_mem_for_comm(
-    void* comm);
+bool close_symm_mem_for_comm(void* comm);
 
 // Invalidate and remove only PAIs whose peer mappings were created by `comm`.
 // The communicator-independent ncclMemAlloc blocks and PAIs for other groups
