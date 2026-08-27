@@ -12,6 +12,11 @@ namespace symmetric_memory {
 
 class NCCLPeerAllocInfo;
 
+// Host-side enqueue lease for NCCL/RCCL operations that may read peer-allocation
+// device tables. The guard must stay alive until the launch/enqueue API returns.
+// It does not wait for device execution to finish; teardown still needs to close
+// admission, drain these host leases, synchronize the device, and only then
+// reclaim device-side PAI tables.
 class TORCH_API NCCLSymmetricMemoryLaunchGuard {
  public:
   NCCLSymmetricMemoryLaunchGuard() = default;
@@ -57,6 +62,7 @@ class TORCH_API NCCLSymmetricMemory : public SymmetricMemory {
   // handle while communicator teardown may be in progress.
   bool is_live_for(ncclComm_t comm) const;
 
+  // Acquires a host-side launch lease for this handle's communicator.
   NCCLSymmetricMemoryLaunchGuard acquire_launch_guard() const;
 
   std::vector<void*> get_buffer_ptrs() override;

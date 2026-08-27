@@ -67,7 +67,9 @@ void forget_rccl_symm_precondition(void* comm);
 // Close admission for NCCL/RCCL symmetric-memory launches using `comm` and wait
 // for host threads that already acquired launch leases to finish enqueueing.
 // Returns true if this communicator had symmetric-memory state that should be
-// drained before reclamation. No-op off ROCm.
+// drained before reclamation. When the function returns true, `drained` is set
+// to whether all admitted launch leases finished before timeout; callers must
+// ignore `drained` when the return value is false. No-op off ROCm.
 bool begin_symm_mem_teardown_for_comm(
     void* comm,
     std::chrono::milliseconds timeout,

@@ -350,9 +350,9 @@ NCCLSymmetricMemoryLaunchGuard acquire_symm_mem_launch_guard(
     std::unique_lock<std::mutex> lock(lifecycle->mutex);
     TORCH_CHECK(
         !lifecycle->closing,
-        "This symmetric-memory handle is bound to a communicator that is "
-        "being destroyed. Rendezvous the tensor again with a live process "
-        "group.");
+        "This symmetric-memory handle is bound to a destroyed communicator or "
+        "freed backing allocation. "
+        "Rendezvous the tensor again with a live process group.");
     ++lifecycle->active_launches;
   }
   return NCCLSymmetricMemoryLaunchGuard([lifecycle]() {
