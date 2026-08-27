@@ -1531,6 +1531,9 @@ class NCCLSymmetricMemoryWinDisabledTest(MultiProcContinuousTest):
 
 @requires_cuda_p2p_access()
 @skip_but_pass_in_sandcastle_if(
+    not TEST_WITH_ROCM, "NCCL symmetric-memory shrink test is ROCm-only"
+)
+@skip_but_pass_in_sandcastle_if(
     nGPUs < 3, "NCCL symmetric-memory shrink test requires 3+ GPUs"
 )
 @skipIfRocmVersionLessThan((10, 1))

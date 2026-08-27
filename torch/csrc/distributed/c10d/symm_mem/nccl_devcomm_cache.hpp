@@ -93,10 +93,6 @@ void invalidate_symm_mem_for_comm(
     void* comm,
     bool reclaim_device_tables);
 
-// Returns true if an earlier no-drain teardown retired device pointer tables
-// for this device and a later device-wide synchronize can safely reclaim them.
-bool has_retired_symm_mem_for_device(const c10::Device& device);
-
 // Reclaim PAIs that were retired by an earlier abort/no-drain path once the
 // caller has since proven the device is idle with a device-wide synchronize.
 void reclaim_retired_symm_mem_for_device(const c10::Device& device);

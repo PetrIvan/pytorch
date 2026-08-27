@@ -34,7 +34,6 @@
 #include <torch/csrc/distributed/c10d/TraceUtils.h>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 #include <torch/csrc/distributed/c10d/cuda/utils.hpp>
-#include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_cache.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #include <torch/torch.h>
@@ -1127,7 +1126,6 @@ void ProcessGroupNCCL::setGroupUid(const std::string& pg_uid) {
       continue;
     }
     c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
-    auto* raw = ncclComm->getNcclComm();
     publishSymmMemComm(device, ncclComm);
   }
 #endif
@@ -1667,7 +1665,6 @@ void ProcessGroupNCCL::shutdown() {
     std::shared_ptr<NCCLComm> ncclComm;
   };
   std::vector<SymmMemTeardownComm> symmMemCommsToTeardown;
-  std::vector<int> symmMemCandidateDevices;
   std::vector<int> symmMemDevicesToDrain;
   std::vector<int> synchronizedSymmMemDevices;
   std::vector<int> undrainedSymmMemDevices;
@@ -1683,7 +1680,6 @@ void ProcessGroupNCCL::shutdown() {
       if (!ncclComm) {
         continue;
       }
-      addDeviceIfMissing(symmMemCandidateDevices, ncclComm->getDeviceIndex());
       if (ncclComm->isAborted()) {
         continue;
       }
@@ -1694,13 +1690,6 @@ void ProcessGroupNCCL::shutdown() {
           {ncclComm->getDeviceIndex(),
            ncclComm->getNcclComm(),
            ncclComm});
-    }
-  }
-
-  for (int deviceIndex : symmMemCandidateDevices) {
-    c10::Device device(at::kCUDA, deviceIndex);
-    if (c10d::symmetric_memory::has_retired_symm_mem_for_device(device)) {
-      addDeviceIfMissing(symmMemDevicesToDrain, deviceIndex);
     }
   }
 
@@ -1804,15 +1793,6 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
   // comms -- a successor PG may have already re-registered under the same
   // group_uid (e.g. restart-after-error), and unconditionally clearing
   // would silently wipe the successor's entry.
-#ifdef NCCL_HAS_LSA_PEER_PTR
-  std::vector<int> symmMemDevicesToReclaim;
-  auto addDeviceIfMissing = [](std::vector<int>& devices, int deviceIndex) {
-    if (std::find(devices.begin(), devices.end(), deviceIndex) ==
-        devices.end()) {
-      devices.push_back(deviceIndex);
-    }
-  };
-#endif
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [_, ncclComm] : devNCCLCommMap_) {
@@ -1820,7 +1800,6 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
         continue;
       }
 #ifdef NCCL_HAS_LSA_PEER_PTR
-      addDeviceIfMissing(symmMemDevicesToReclaim, ncclComm->getDeviceIndex());
       if (ncclComm->isAborted()) {
         continue;
       }
@@ -1844,30 +1823,6 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
 #endif
     }
   }
-#ifdef NCCL_HAS_LSA_PEER_PTR
-  if (!c10d::symmetric_memory::is_finalizing()) {
-    for (int deviceIndex : symmMemDevicesToReclaim) {
-      c10::Device device(at::kCUDA, deviceIndex);
-      if (!c10d::symmetric_memory::has_retired_symm_mem_for_device(device)) {
-        continue;
-      }
-      try {
-        c10::cuda::CUDAGuard guard(deviceIndex);
-        C10_CUDA_CHECK(cudaDeviceSynchronize());
-        c10d::symmetric_memory::reclaim_retired_symm_mem_for_device(device);
-      } catch (const std::exception& e) {
-        LOG(WARNING) << logPrefix()
-                     << "Failed to reclaim retired symmetric-memory PAIs from "
-                        "ProcessGroupNCCL destructor: "
-                     << e.what();
-      } catch (...) {
-        LOG(WARNING) << logPrefix()
-                     << "Failed to reclaim retired symmetric-memory PAIs from "
-                        "ProcessGroupNCCL destructor";
-      }
-    }
-  }
-#endif
 #endif
 
   // `shutdown()` or `abort` already called. Skip the favor of disposing

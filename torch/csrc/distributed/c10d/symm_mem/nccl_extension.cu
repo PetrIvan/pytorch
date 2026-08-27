@@ -168,6 +168,8 @@ void nccl_put(at::Tensor& tensor, const int64_t peer) {
       "put op currently supports contiguous tensors only");
   // TODO: rendezvous should remember the group name
   auto symm_mem = c10d::symmetric_memory::rendezvous(tensor, "0");
+  auto* nccl_symm_mem = dynamic_cast<NCCLSymmetricMemory*>(symm_mem.get());
+  auto launch_guard = nccl_symm_mem->acquire_launch_guard();
   int threads = THREADS_PER_BLOCK;
   int blocks  = (tensor.numel() + threads - 1) / threads;
   c10::cuda::CUDAGuard guard(tensor.device());
@@ -190,6 +192,8 @@ void nccl_wait_for_signal(at::Tensor& sigpad, int64_t signal) {
   c10::cuda::CUDAGuard guard(sigpad.device());
   auto stream = at::cuda::getCurrentCUDAStream();
   auto symm_mem = c10d::symmetric_memory::rendezvous(sigpad, "0");
+  auto* nccl_symm_mem = dynamic_cast<NCCLSymmetricMemory*>(symm_mem.get());
+  auto launch_guard = nccl_symm_mem->acquire_launch_guard();
 
   // Always use device-side kernel because this function waits for a SPECIFIC signal value.
   // ncclWaitSignal only synchronizes on a channel without checking values, so it's not
@@ -212,6 +216,8 @@ void nccl_put_with_signal(at::Tensor& tensor, int64_t signal, int64_t peer) {
       "put op currently supports contiguous tensors only");
   // TODO: rendezvous should remember the group name
   auto symm_mem = c10d::symmetric_memory::rendezvous(tensor, "0");
+  auto* nccl_symm_mem = dynamic_cast<NCCLSymmetricMemory*>(symm_mem.get());
+  auto launch_guard = nccl_symm_mem->acquire_launch_guard();
   c10::cuda::CUDAGuard guard(tensor.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -268,6 +274,8 @@ void nccl_get(at::Tensor& tensor, const int64_t peer) {
       "get op currently supports contiguous tensors only");
   // TODO: rendezvous should remember the group name
   auto symm_mem = c10d::symmetric_memory::rendezvous(tensor, "0");
+  auto* nccl_symm_mem = dynamic_cast<NCCLSymmetricMemory*>(symm_mem.get());
+  auto launch_guard = nccl_symm_mem->acquire_launch_guard();
   c10::cuda::CUDAGuard guard(tensor.device());
   int threads = THREADS_PER_BLOCK;
   int blocks  = (tensor.numel() + threads - 1) / threads;
@@ -327,6 +335,8 @@ void nccl_get_out(
     return;
   }
 
+  auto* nccl_hdl = dynamic_cast<NCCLSymmetricMemory*>(hdl.get());
+  auto launch_guard = nccl_hdl->acquire_launch_guard();
   c10::cuda::CUDAGuard guard(dst.device());
   int threads = THREADS_PER_BLOCK;
   int blocks = (nbytes + threads - 1) / threads;
