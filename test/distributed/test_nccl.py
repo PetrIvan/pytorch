@@ -1536,6 +1536,10 @@ class NCCLSymmetricMemoryWinDisabledTest(MultiProcContinuousTest):
 @skip_but_pass_in_sandcastle_if(
     nGPUs < 3, "NCCL symmetric-memory shrink test requires 3+ GPUs"
 )
+@skip_but_pass_in_sandcastle_if(
+    TEST_WITH_ROCM and getRocmVersion() == (7, 14),
+    "RCCL CUMEM/P2P communicator init fails on ROCm 7.14 (p2p_tmp.cc:358)",
+)
 class NCCLSymmetricMemoryShrinkTest(MultiProcContinuousTest):
     @property
     def world_size(self):
