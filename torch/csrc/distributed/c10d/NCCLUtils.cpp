@@ -4,7 +4,6 @@
 #include <fmt/format.h>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_cache.hpp>
-#include <mutex>
 #include <thread>
 #include <vector>
 
