@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from torch.testing._internal.common_utils import IS_LINUX, run_tests, TestCase
+from torch.testing._internal.common_utils import IS_LINUX, IS_S390X, run_tests, TestCase
 
 
 @unittest.skipIf(not IS_LINUX, "Only works on linux")
@@ -106,6 +106,7 @@ class TestTorchrun(TestCase):
                 f"Failed to launch multiple instances for inference, got {num}"
             )
 
+    @unittest.skipIf(IS_S390X, "Not set up on s390x CI")
     def test_multi_ncores_per_instance_setting(self):
         num = 0
         with subprocess.Popen(
