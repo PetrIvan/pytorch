@@ -26,6 +26,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from ...ir import Buffer, ComputedBuffer, Pointwise, Reduction
 from ...kernel.gemm_epilogue import (
+    GEMM_REDUCTION_IDENTITY_SOURCE,
     GemmReductionConfig,
     GemmReductionGeometry,
     GemmReductionPlan,
@@ -36,12 +37,10 @@ from ...kernel.loop_ir_epilogue_lowering import (
     GemmEpilogueIRFinalizer,
     GemmEpilogueIRStore,
     grouped_reduction_axis_ir,
+    grouped_reduction_pattern_ir,
 )
 from ...scheduler import BaseSchedulerNode
 from ...virtualized import V
-
-
-GEMM_REDUCTION_IDENTITY_SOURCE = "def _local_reduce_source(value):\n    return value"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -451,8 +450,6 @@ class NVGemmEpilogueLowering:
             group, axis = geometry.group, geometry.axis
         if group <= 1:
             return None
-
-        from ...kernel.loop_ir_epilogue_lowering import grouped_reduction_pattern_ir
 
         store = analysis.store(node.get_name())
         reduction_ir = (
