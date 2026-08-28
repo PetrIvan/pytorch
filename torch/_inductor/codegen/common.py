@@ -638,23 +638,33 @@ def init_backend_registration() -> None:
         private_backend != "privateuseone"
         and get_scheduling_for_device(private_backend) is None
     ):
-        from torch.utils.backend_registration import _get_custom_mod_func
+        device_mod = getattr(torch, private_backend, None)
+        backend_init = getattr(device_mod, "_inductor_backend_init", None)
+        if backend_init is not None:
+            # Optional vendor hook on the device module (the one registered via
+            # torch._register_device_module): runs the vendor's full inductor
+            # integration and must call register_backend_for_device itself.
+            # Fired once per process (this function is cached); a failing hook
+            # is not cached and retries on the next compile.
+            backend_init()
+        else:
+            from torch.utils.backend_registration import _get_custom_mod_func
 
-        try:
-            device_scheduling = _get_custom_mod_func("Scheduling")
-            wrapper_codegen = _get_custom_mod_func("PythonWrapperCodegen")
-            cpp_wrapper_codegen = _get_custom_mod_func("CppWrapperCodegen")
-            fx_wrapper_codegen = _get_custom_mod_func("WrapperFxCodegen")
-            if device_scheduling and wrapper_codegen and cpp_wrapper_codegen:
-                register_backend_for_device(
-                    private_backend,
-                    device_scheduling,
-                    wrapper_codegen,
-                    cpp_wrapper_codegen,
-                    fx_wrapper_codegen,
-                )
-        except RuntimeError:
-            pass
+            try:
+                device_scheduling = _get_custom_mod_func("Scheduling")
+                wrapper_codegen = _get_custom_mod_func("PythonWrapperCodegen")
+                cpp_wrapper_codegen = _get_custom_mod_func("CppWrapperCodegen")
+                fx_wrapper_codegen = _get_custom_mod_func("WrapperFxCodegen")
+                if device_scheduling and wrapper_codegen and cpp_wrapper_codegen:
+                    register_backend_for_device(
+                        private_backend,
+                        device_scheduling,
+                        wrapper_codegen,
+                        cpp_wrapper_codegen,
+                        fx_wrapper_codegen,
+                    )
+            except RuntimeError:
+                pass
 
 
 def index_prevent_reordering(

@@ -57,6 +57,41 @@ Define the initialization hook `_autoload` for backend initialization in [torch_
 
 ::::
 
+### Lazy Inductor Backend Initialization
+
+Integrating with torch.compile typically means registering device-specific codegen
+classes, decompositions, and passes with Inductor. Doing all of that inside `_autoload`
+would make every user pay the cost at `import torch`, even those who never compile.
+To defer it, define an `_inductor_backend_init` attribute on the device module passed
+to `torch._register_device_module`: a no-arg callable that Inductor invokes once per
+process, at the first Inductor compilation (before decomposition selection), on every
+entry point (`torch.compile`, direct `compile_fx()`, and AOTInductor).
+
+```python
+from torch._inductor.codegen.common import register_backend_for_device
+
+
+def _inductor_backend_init():
+    # Runs on the first inductor compile, not at import time.
+    from my_backend._inductor import MyCppWrapperCodegen, MyScheduling, MyWrapperCodegen
+
+    register_backend_for_device(
+        "my_device", MyScheduling, MyWrapperCodegen, MyCppWrapperCodegen
+    )
+    # May also register decompositions, device op overrides, and custom passes.
+
+
+device_module._inductor_backend_init = _inductor_backend_init
+torch._register_device_module("my_device", device_module)
+```
+
+The hook must call `register_backend_for_device` itself and should be idempotent
+(concurrent first compiles may both invoke it). If the hook raises, the exception
+propagates out of the compile and the hook is retried on the next compile. Device
+modules that instead expose `Scheduling`, `PythonWrapperCodegen`, and
+`CppWrapperCodegen` attributes directly are still supported, but that form imports
+the codegen classes eagerly at `import torch`.
+
 ## Result
 
 After setting up the entry point and backend, build and install your backend. Now, we can use the new accelerator without explicitly importing it.
