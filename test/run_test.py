@@ -2012,6 +2012,8 @@ def load_test_times_from_file(file: str) -> dict[str, Any]:
         job_name = build_env
     else:
         job_name = get_job_base_name(job_name)
+    if os.environ.get("GITHUB_WORKFLOW") == "trunk-rocm-sandbox":
+        job_name = "linux-jammy-rocm-py3.10-mi350"
     test_config = os.environ.get("TEST_CONFIG")
     print_to_stderr(f"JOB_NAME={raw_job_name}")
     print_to_stderr(f"BUILD_ENVIRONMENT={build_env}")
